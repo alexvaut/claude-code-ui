@@ -108,7 +108,8 @@ function getCIStatusColor(status: CIStatus): "green" | "red" | "yellow" | "gray"
 
 export function SessionCard({ session }: SessionCardProps) {
   const showPendingTool = session.hasPendingToolUse && session.pendingTool;
-  const dirName = session.cwd.split("/").pop() || session.cwd;
+  // Show path from ~ (e.g., ~/programs/project)
+  const dirPath = session.cwd.replace(/^\/Users\/[^/]+/, "~");
 
   return (
     <HoverCard.Root openDelay={300}>
@@ -118,7 +119,7 @@ export function SessionCard({ session }: SessionCardProps) {
             {/* Header: directory and time */}
             <Flex justify="between" align="center">
               <Text size="1" color="gray" style={{ fontFamily: "var(--code-font-family)" }}>
-                {dirName}
+                {dirPath}
               </Text>
               <Text size="1" color="gray">
                 {formatTimeAgo(session.lastActivityAt)}

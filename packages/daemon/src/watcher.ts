@@ -149,6 +149,7 @@ export class SessionWatcher extends EventEmitter {
         gitInfo = {
           repoUrl: existingSession.gitRepoUrl,
           repoId: existingSession.gitRepoId,
+          branch: existingSession.gitBranch,
           isGitRepo: existingSession.gitRepoUrl !== null || existingSession.gitBranch !== null,
         };
       } else {
@@ -165,13 +166,13 @@ export class SessionWatcher extends EventEmitter {
       const status = deriveStatus(allEntries);
       const previousStatus = existingSession?.status ?? null;
 
-      // Build session state
+      // Build session state - prefer branch from git info over log entry
       const session: SessionState = {
         sessionId,
         filepath,
         encodedDir: extractEncodedDir(filepath),
         cwd: metadata.cwd,
-        gitBranch: metadata.gitBranch,
+        gitBranch: gitInfo.branch || metadata.gitBranch,
         originalPrompt: metadata.originalPrompt,
         startedAt: metadata.startedAt,
         status,

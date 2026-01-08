@@ -4,6 +4,7 @@ import { join, dirname } from "node:path";
 export interface GitInfo {
   repoUrl: string | null;      // Full URL: https://github.com/owner/repo or git@github.com:owner/repo
   repoId: string | null;       // Normalized: owner/repo
+  branch: string | null;       // Current branch name
   isGitRepo: boolean;
 }
 
@@ -64,6 +65,28 @@ function parseGitUrl(url: string): { repoUrl: string; repoId: string } | null {
 }
 
 /**
+ * Read the current branch from .git/HEAD
+ */
+async function getCurrentBranch(gitDir: string): Promise<string | null> {
+  try {
+    const headPath = join(gitDir, "HEAD");
+    const headContent = await readFile(headPath, "utf-8");
+    const trimmed = headContent.trim();
+
+    // HEAD usually contains "ref: refs/heads/branch-name"
+    const match = trimmed.match(/^ref: refs\/heads\/(.+)$/);
+    if (match) {
+      return match[1];
+    }
+
+    // Detached HEAD - return null or the short SHA
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Read the git config file and extract the origin remote URL.
  */
 async function getOriginUrl(gitDir: string): Promise<string | null> {
@@ -106,26 +129,30 @@ export async function getGitInfo(cwd: string): Promise<GitInfo> {
   const gitDir = await findGitDir(cwd);
 
   if (!gitDir) {
-    return { repoUrl: null, repoId: null, isGitRepo: false };
+    return { repoUrl: null, repoId: null, branch: null, isGitRepo: false };
   }
 
-  const originUrl = await getOriginUrl(gitDir);
+  const [originUrl, branch] = await Promise.all([
+    getOriginUrl(gitDir),
+    getCurrentBranch(gitDir),
+  ]);
 
   if (!originUrl) {
     // It's a git repo but has no origin remote
-    return { repoUrl: null, repoId: null, isGitRepo: true };
+    return { repoUrl: null, repoId: null, branch, isGitRepo: true };
   }
 
   const parsed = parseGitUrl(originUrl);
 
   if (!parsed) {
     // It's a git repo with an origin, but not GitHub
-    return { repoUrl: originUrl, repoId: null, isGitRepo: true };
+    return { repoUrl: originUrl, repoId: null, branch, isGitRepo: true };
   }
 
   return {
     repoUrl: parsed.repoUrl,
     repoId: parsed.repoId,
+    branch,
     isGitRepo: true,
   };
 }
