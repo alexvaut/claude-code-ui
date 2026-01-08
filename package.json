@@ -1,0 +1,24 @@
+{
+  "name": "claude-code-ui",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "concurrently -n daemon,ui -c blue,green \"pnpm serve\" \"pnpm dev\"",
+    "dev": "pnpm --filter @claude-code-ui/ui dev",
+    "serve": "pnpm --filter @claude-code-ui/daemon serve",
+    "watch": "pnpm --filter @claude-code-ui/daemon watch",
+    "watch:recent": "pnpm --filter @claude-code-ui/daemon watch:recent",
+    "watch:active": "pnpm --filter @claude-code-ui/daemon watch:active"
+  },
+  "engines": {
+    "node": ">=20.19.0"
+  },
+  "packageManager": "pnpm@10.26.0",
+  "devDependencies": {
+    "concurrently": "^9.2.1"
+  },
+  "dependencies": {
+    "fastq": "^1.20.1"
+  }
+}
