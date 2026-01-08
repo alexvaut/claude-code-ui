@@ -310,6 +310,22 @@ export function getCachedPR(cwd: string, branch: string): PRInfo | null {
   return prCache.get(cacheKey)?.pr ?? null;
 }
 
+/**
+ * Clear PR cache and stop CI polling when branch changes.
+ * This ensures we don't show stale PR info from the old branch.
+ */
+export function clearPRForSession(sessionId: string, oldBranch: string | null, cwd: string): void {
+  // Stop CI polling for this session
+  stopCIPolling(sessionId);
+
+  // Clear cache for the old branch if we know it
+  if (oldBranch) {
+    const cacheKey = `${cwd}:${oldBranch}`;
+    prCache.delete(cacheKey);
+    console.log(`[PR] Cleared cache for old branch: ${oldBranch}`);
+  }
+}
+
 // Test helpers
 export const __test__ = {
   setExecAsync(fn: ExecFn) {

@@ -9,7 +9,7 @@ import { sessionsStateSchema, type Session, type RecentOutput, type PRInfo } fro
 import type { SessionState } from "./watcher.js";
 import type { LogEntry } from "./types.js";
 import { generateAISummary, generateGoal } from "./summarizer.js";
-import { queuePRCheck, getCachedPR, setOnPRUpdate, stopAllPolling } from "./github.js";
+import { queuePRCheck, getCachedPR, setOnPRUpdate, stopAllPolling, clearPRForSession } from "./github.js";
 import path from "node:path";
 import os from "node:os";
 
@@ -91,6 +91,16 @@ export class StreamServer {
       throw new Error("Server not started");
     }
 
+    // Check if branch changed by comparing with cached session
+    const cachedSession = this.sessionCache.get(sessionState.sessionId);
+    const oldBranch = cachedSession?.gitBranch ?? null;
+    const branchChanged = oldBranch !== null && oldBranch !== sessionState.gitBranch;
+
+    if (branchChanged) {
+      console.log(`[PR] Branch changed for ${sessionState.sessionId.slice(0, 8)}: ${oldBranch} → ${sessionState.gitBranch}`);
+      clearPRForSession(sessionState.sessionId, oldBranch, sessionState.cwd);
+    }
+
     // Cache session state for PR update callbacks
     this.sessionCache.set(sessionState.sessionId, sessionState);
 
@@ -100,7 +110,7 @@ export class StreamServer {
       generateAISummary(sessionState),
     ]);
 
-    // Get cached PR info if available
+    // Get cached PR info if available (will be null if branch just changed)
     const pr = sessionState.gitBranch
       ? getCachedPR(sessionState.cwd, sessionState.gitBranch)
       : null;
@@ -273,13 +283,13 @@ function extractPendingTool(session: SessionState): Session["pendingTool"] {
     return null;
   }
 
-  // Find the last assistant message with tool_use
+  // Find the last assistant message with tool_use (excluding Task - subagents run automatically)
   const entries = session.entries;
   for (let i = entries.length - 1; i >= 0; i--) {
     const entry = entries[i];
     if (entry.type === "assistant") {
       for (const block of entry.message.content) {
-        if (block.type === "tool_use") {
+        if (block.type === "tool_use" && block.name !== "Task") {
           const tool = block.name;
           // Extract target based on tool type
           let target = "";

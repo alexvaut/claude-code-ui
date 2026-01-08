@@ -65,9 +65,9 @@ function parseGitUrl(url: string): { repoUrl: string; repoId: string } | null {
 }
 
 /**
- * Read the current branch from .git/HEAD
+ * Read the current branch from .git/HEAD (internal use)
  */
-async function getCurrentBranch(gitDir: string): Promise<string | null> {
+async function _getCurrentBranchInternal(gitDir: string): Promise<string | null> {
   try {
     const headPath = join(gitDir, "HEAD");
     const headContent = await readFile(headPath, "utf-8");
@@ -134,7 +134,7 @@ export async function getGitInfo(cwd: string): Promise<GitInfo> {
 
   const [originUrl, branch] = await Promise.all([
     getOriginUrl(gitDir),
-    getCurrentBranch(gitDir),
+    _getCurrentBranchInternal(gitDir),
   ]);
 
   if (!originUrl) {
@@ -158,18 +158,90 @@ export async function getGitInfo(cwd: string): Promise<GitInfo> {
 }
 
 // Cache git info by cwd to avoid repeated filesystem lookups
-const gitInfoCache = new Map<string, GitInfo>();
+// Store both the info and the git directory path for branch refresh
+interface CachedGitInfo {
+  info: GitInfo;
+  gitDir: string | null;
+  lastChecked: number;
+}
+
+const gitInfoCache = new Map<string, CachedGitInfo>();
+const CACHE_TTL_MS = 60 * 1000; // 1 minute
 
 /**
  * Get GitHub repo info with caching.
+ * Repo URL and ID are cached longer, but branch is refreshed more frequently.
  */
 export async function getGitInfoCached(cwd: string): Promise<GitInfo> {
   const cached = gitInfoCache.get(cwd);
-  if (cached) {
-    return cached;
+  const now = Date.now();
+
+  // If we have cached info and it's recent, just refresh the branch
+  if (cached && now - cached.lastChecked < CACHE_TTL_MS) {
+    // Quick branch refresh
+    if (cached.gitDir) {
+      const branch = await getCurrentBranchFromDir(cached.gitDir);
+      if (branch !== cached.info.branch) {
+        cached.info = { ...cached.info, branch };
+      }
+    }
+    return cached.info;
   }
 
+  // Full refresh
+  const gitDir = await findGitDir(cwd);
   const info = await getGitInfo(cwd);
-  gitInfoCache.set(cwd, info);
+
+  gitInfoCache.set(cwd, {
+    info,
+    gitDir,
+    lastChecked: now,
+  });
+
   return info;
+}
+
+/**
+ * Get just the current branch for a cwd.
+ * Fast operation that doesn't require full git info lookup.
+ */
+export async function getCurrentBranch(cwd: string): Promise<string | null> {
+  const cached = gitInfoCache.get(cwd);
+  if (cached?.gitDir) {
+    return getCurrentBranchFromDir(cached.gitDir);
+  }
+
+  const gitDir = await findGitDir(cwd);
+  if (!gitDir) return null;
+
+  return getCurrentBranchFromDir(gitDir);
+}
+
+/**
+ * Read the current branch from a known .git directory
+ */
+async function getCurrentBranchFromDir(gitDir: string): Promise<string | null> {
+  try {
+    const headPath = join(gitDir, "HEAD");
+    const headContent = await readFile(headPath, "utf-8");
+    const trimmed = headContent.trim();
+
+    // HEAD usually contains "ref: refs/heads/branch-name"
+    const match = trimmed.match(/^ref: refs\/heads\/(.+)$/);
+    if (match) {
+      return match[1];
+    }
+
+    // Detached HEAD - return null or the short SHA
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Clear git cache for a specific cwd (e.g., after branch change)
+ */
+export function clearGitCache(cwd: string): void {
+  gitInfoCache.delete(cwd);
 }

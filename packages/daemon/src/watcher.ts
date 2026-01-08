@@ -26,6 +26,8 @@ export interface SessionState {
   // GitHub repo info
   gitRepoUrl: string | null;   // https://github.com/owner/repo
   gitRepoId: string | null;    // owner/repo (for grouping)
+  // Set when branch changed since last update
+  branchChanged?: boolean;
 }
 
 export interface SessionEvent {
@@ -162,6 +164,17 @@ export class SessionWatcher extends EventEmitter {
         gitInfo = await getGitInfoCached(metadata.cwd);
       }
 
+      // Always refresh branch for existing sessions (branch may have changed)
+      let branchChanged = false;
+      if (existingSession) {
+        const currentBranch = await getGitInfoCached(metadata.cwd);
+        if (currentBranch.branch !== existingSession.gitBranch) {
+          gitInfo = currentBranch;
+          branchChanged = true;
+          console.log(`[Watcher] Branch changed for ${sessionId}: ${existingSession.gitBranch} → ${currentBranch.branch}`);
+        }
+      }
+
       // Derive status from all entries
       const status = deriveStatus(allEntries);
       const previousStatus = existingSession?.status;
@@ -180,6 +193,7 @@ export class SessionWatcher extends EventEmitter {
         bytePosition: newPosition,
         gitRepoUrl: gitInfo.repoUrl,
         gitRepoId: gitInfo.repoId,
+        branchChanged,
       };
 
       // Store session
@@ -195,7 +209,7 @@ export class SessionWatcher extends EventEmitter {
           type: "created",
           session,
         } satisfies SessionEvent);
-      } else if (hasStatusChange || hasNewMessages) {
+      } else if (hasStatusChange || hasNewMessages || branchChanged) {
         this.emit("session", {
           type: "updated",
           session,

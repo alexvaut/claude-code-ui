@@ -47,12 +47,13 @@ export const statusMachine = setup({
 }).createMachine({
   id: "sessionStatus",
   initial: "waiting_for_input",
-  context: {
+  // Use a factory function to ensure each actor gets a fresh context
+  context: () => ({
     lastActivityAt: "",
     messageCount: 0,
     hasPendingToolUse: false,
     pendingToolIds: [],
-  },
+  }),
   states: {
     idle: {
       on: {
@@ -73,12 +74,24 @@ export const statusMachine = setup({
           },
         },
         ASSISTANT_TOOL_USE: {
-          target: "waiting_for_approval",
+          // Stay in working - only go to waiting_for_approval after timeout
           actions: ({ context, event }) => {
             context.lastActivityAt = event.timestamp;
             context.messageCount += 1;
             context.hasPendingToolUse = true;
             context.pendingToolIds = event.toolUseIds;
+          },
+        },
+        TOOL_RESULT: {
+          // Tool completed - clear pending state, stay working
+          actions: ({ context, event }) => {
+            context.lastActivityAt = event.timestamp;
+            context.messageCount += 1;
+            const remaining = context.pendingToolIds.filter(
+              (id) => !event.toolUseIds.includes(id)
+            );
+            context.pendingToolIds = remaining;
+            context.hasPendingToolUse = remaining.length > 0;
           },
         },
         TURN_END: {
@@ -88,6 +101,9 @@ export const statusMachine = setup({
             context.hasPendingToolUse = false;
             context.pendingToolIds = [];
           },
+        },
+        APPROVAL_TIMEOUT: {
+          target: "waiting_for_approval",
         },
         STALE_TIMEOUT: {
           target: "waiting_for_input",
@@ -161,14 +177,17 @@ export function logEntryToEvent(entry: LogEntry): StatusEvent | null {
 
   if (entry.type === "assistant") {
     const assistantEntry = entry as AssistantEntry;
-    const toolUseBlocks = assistantEntry.message.content.filter((b) => b.type === "tool_use");
+    // Filter out Task tools - subagents run automatically and don't need approval
+    const toolUseBlocks = assistantEntry.message.content.filter(
+      (b) => b.type === "tool_use" && b.name !== "Task"
+    );
 
     if (toolUseBlocks.length > 0) {
       const toolUseIds = toolUseBlocks.map((b) => b.type === "tool_use" ? b.id : "");
       return { type: "ASSISTANT_TOOL_USE", timestamp: assistantEntry.timestamp, toolUseIds };
     }
 
-    // Streaming assistant message (no tool_use)
+    // Streaming assistant message (no tool_use, or only Task tools)
     return { type: "ASSISTANT_STREAMING", timestamp: assistantEntry.timestamp };
   }
 
