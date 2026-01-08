@@ -35,8 +35,8 @@ export function KanbanColumn({ title, sessions, color }: KanbanColumnProps) {
     <Box
       style={{
         flex: 1,
-        minWidth: 280,
-        maxWidth: 400,
+        minWidth: 320,
+        maxWidth: 500,
         backgroundColor: colorMap[color],
         borderRadius: "var(--radius-4)",
         border: `1px solid var(--${color === "gray" ? "slate" : color === "green" ? "grass" : color === "yellow" ? "amber" : "orange"}-6)`,
