@@ -203,16 +203,10 @@ export function SessionCard({ session, disableHover }: SessionCardProps) {
                   <Markdown
                     components={{
                       p: ({ children }) => <Text as="p" size="1" mb="2">{children}</Text>,
-                      code: ({ children, className }) => {
-                        const isBlock = className?.includes("language-");
-                        return isBlock ? (
-                          <Code as="pre" size="1" my="2" p="2">{children}</Code>
-                        ) : (
-                          <Code size="1">{children}</Code>
-                        );
-                      },
-                      ul: ({ children }) => <Box as="ul" pl="4" mb="2">{children}</Box>,
-                      ol: ({ children }) => <Box as="ol" pl="4" mb="2">{children}</Box>,
+                      pre: ({ children }) => <Code size="1" my="2" p="2">{children}</Code>,
+                      code: ({ children }) => <Code size="1">{children}</Code>,
+                      ul: ({ children }) => <ul style={{ paddingLeft: "var(--space-4)", marginBottom: "var(--space-2)" }}>{children}</ul>,
+                      ol: ({ children }) => <ol style={{ paddingLeft: "var(--space-4)", marginBottom: "var(--space-2)" }}>{children}</ol>,
                       li: ({ children }) => <Text as="li" size="1">{children}</Text>,
                       h1: ({ children }) => <Heading size="3" mb="2">{children}</Heading>,
                       h2: ({ children }) => <Heading size="2" mb="2">{children}</Heading>,
