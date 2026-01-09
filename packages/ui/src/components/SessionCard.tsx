@@ -1,5 +1,16 @@
-import { Card, Flex, Text, Code, Box, HoverCard, Badge, Heading } from "@radix-ui/themes";
+import { Card, Flex, Text, Code, Box, HoverCard, Badge, Heading, Separator } from "@radix-ui/themes";
 import Markdown from "react-markdown";
+import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
+import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
+
+// Customize oneDark to improve comment contrast
+const codeTheme = {
+  ...oneDark,
+  'comment': { ...oneDark['comment'], color: '#8b949e' },
+  'prolog': { ...oneDark['prolog'], color: '#8b949e' },
+  'doctype': { ...oneDark['doctype'], color: '#8b949e' },
+  'cdata': { ...oneDark['cdata'], color: '#8b949e' },
+};
 import type { Session, CIStatus } from "../data/schema";
 
 interface SessionCardProps {
@@ -170,7 +181,13 @@ export function SessionCard({ session, disableHover }: SessionCardProps) {
         </Card>
       </HoverCard.Trigger>
 
-      <HoverCard.Content size="3" style={{ minWidth: "600px", minHeight: "400px" }}>
+      <HoverCard.Content
+        size="3"
+        side="right"
+        sideOffset={8}
+        collisionPadding={20}
+        style={{ width: 500, maxWidth: "calc(100vw - 40px)", maxHeight: "calc(100vh - 40px)" }}
+      >
         <Flex direction="column" gap="3" style={{ height: "100%" }}>
           {/* Header: goal */}
           <Heading size="3" weight="bold" highContrast>
@@ -193,24 +210,41 @@ export function SessionCard({ session, disableHover }: SessionCardProps) {
               session.recentOutput.map((output, i) => (
                 <Box
                   key={i}
-                  mb={i < session.recentOutput.length - 1 ? "3" : "0"}
                   style={{ color: getRoleColor(output.role) }}
                   className="markdown-content"
                 >
                   {output.role === "user" && (
-                    <Text size="1" weight="medium" mb="1">You:</Text>
+                    <>
+                      <Separator size="4" color="blue" mb="4" />
+                      <Text as="p" size="1" weight="medium" mb="3">You:</Text>
+                    </>
                   )}
                   <Markdown
                     components={{
-                      p: ({ children }) => <Text as="p" size="1" mb="2">{children}</Text>,
-                      pre: ({ children }) => <Code size="1" my="2" p="2">{children}</Code>,
-                      code: ({ children }) => <Code size="1">{children}</Code>,
-                      ul: ({ children }) => <ul style={{ paddingLeft: "var(--space-4)", marginBottom: "var(--space-2)" }}>{children}</ul>,
-                      ol: ({ children }) => <ol style={{ paddingLeft: "var(--space-4)", marginBottom: "var(--space-2)" }}>{children}</ol>,
-                      li: ({ children }) => <Text as="li" size="1">{children}</Text>,
-                      h1: ({ children }) => <Heading size="3" mb="2">{children}</Heading>,
-                      h2: ({ children }) => <Heading size="2" mb="2">{children}</Heading>,
-                      h3: ({ children }) => <Heading size="1" mb="1">{children}</Heading>,
+                      p: ({ children }) => <Text as="p" size="1" mb="4">{children}</Text>,
+                      code: ({ className, children }) => {
+                        const match = /language-(\w+)/.exec(className || "");
+                        const isBlock = Boolean(match);
+                        return isBlock ? (
+                          <SyntaxHighlighter
+                            style={codeTheme}
+                            language={match![1]}
+                            PreTag="div"
+                            customStyle={{ margin: 0, borderRadius: "var(--radius-2)", fontSize: "var(--font-size-1)" }}
+                          >
+                            {String(children).replace(/\n$/, "")}
+                          </SyntaxHighlighter>
+                        ) : (
+                          <Code size="1">{children}</Code>
+                        );
+                      },
+                      pre: ({ children }) => <Box mb="4">{children}</Box>,
+                      ul: ({ children }) => <ul style={{ paddingLeft: "var(--space-4)", marginBottom: "var(--space-4)" }}>{children}</ul>,
+                      ol: ({ children }) => <ol style={{ paddingLeft: "var(--space-4)", marginBottom: "var(--space-4)" }}>{children}</ol>,
+                      li: ({ children }) => <Text as="li" mb="2" size="1">{children}</Text>,
+                      h1: ({ children }) => <Heading size="3" mb="4">{children}</Heading>,
+                      h2: ({ children }) => <Heading size="2" mb="4">{children}</Heading>,
+                      h3: ({ children }) => <Heading size="1" mb="4">{children}</Heading>,
                       a: ({ href, children }) => (
                         <a href={href} target="_blank" rel="noopener noreferrer">
                           {children}
@@ -220,6 +254,9 @@ export function SessionCard({ session, disableHover }: SessionCardProps) {
                   >
                     {output.content}
                   </Markdown>
+                  {output.role === "user" && (
+                    <Separator size="4" color="blue" my="4" />
+                  )}
                 </Box>
               ))
             ) : (
