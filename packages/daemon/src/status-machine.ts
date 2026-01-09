@@ -23,7 +23,6 @@ export type StatusEvent =
   | { type: "ASSISTANT_STREAMING"; timestamp: string }
   | { type: "ASSISTANT_TOOL_USE"; timestamp: string; toolUseIds: string[] }
   | { type: "TURN_END"; timestamp: string }
-  | { type: "APPROVAL_TIMEOUT" }
   | { type: "STALE_TIMEOUT" };
 
 // The three possible status states (idle is determined by UI based on elapsed time)
@@ -72,7 +71,9 @@ export const statusMachine = setup({
           },
         },
         ASSISTANT_TOOL_USE: {
-          // Stay in working - only go to waiting_for_approval after timeout
+          // Immediately transition to waiting_for_approval - tools that need approval
+          // will wait for user action, auto-approved tools are already filtered out
+          target: "waiting_for_approval",
           actions: ({ context, event }) => {
             context.lastActivityAt = event.timestamp;
             context.messageCount += 1;
@@ -99,9 +100,6 @@ export const statusMachine = setup({
             context.hasPendingToolUse = false;
             context.pendingToolIds = [];
           },
-        },
-        APPROVAL_TIMEOUT: {
-          target: "waiting_for_approval",
         },
         STALE_TIMEOUT: {
           target: "waiting_for_input",
@@ -243,19 +241,16 @@ export function deriveStatusFromMachine(entries: LogEntry[]): {
   let context = snapshot.context;
   let stateValue = snapshot.value as StatusState;
 
-  // Check for timeouts based on last activity
+  // Check for stale sessions (working state with no activity for a while)
   const now = Date.now();
   const lastActivityTime = context.lastActivityAt ? new Date(context.lastActivityAt).getTime() : 0;
   const timeSinceActivity = now - lastActivityTime;
 
-  const APPROVAL_TIMEOUT_MS = 15 * 1000; // 15 seconds - longer to avoid false positives during active tool execution
   const STALE_TIMEOUT_MS = 60 * 1000; // 60 seconds
 
-  // Apply timeout transitions (idle is handled by the UI based on elapsed time)
-  if (stateValue === "working" && context.hasPendingToolUse && timeSinceActivity > APPROVAL_TIMEOUT_MS) {
-    // Tool use pending for too long - should be in waiting_for_approval
-    actor.send({ type: "APPROVAL_TIMEOUT" });
-  } else if (stateValue === "working" && !context.hasPendingToolUse && timeSinceActivity > STALE_TIMEOUT_MS) {
+  // Apply stale timeout if working with no pending tool use for too long
+  // (idle status is handled by the UI based on elapsed time)
+  if (stateValue === "working" && !context.hasPendingToolUse && timeSinceActivity > STALE_TIMEOUT_MS) {
     // Stale without tool use - probably turn ended without marker
     actor.send({ type: "STALE_TIMEOUT" });
   }

@@ -186,7 +186,7 @@ describe("Session Tracking", () => {
       expect(status.hasPendingToolUse).toBe(false);
     });
 
-    it("should detect pending tool use as working with hasPendingToolUse", async () => {
+    it("should detect pending tool use as waiting with hasPendingToolUse", async () => {
       const entry1 = createUserEntry("Run a command");
       const entry2 = createAssistantEntry("I'll run that for you", new Date().toISOString(), true);
       await writeFile(TEST_LOG_FILE, entry1 + entry2);
@@ -194,8 +194,8 @@ describe("Session Tracking", () => {
       const { entries } = await tailJSONL(TEST_LOG_FILE, 0);
       const status = deriveStatus(entries);
 
-      // Tool use requested = working with pending tool
-      expect(status.status).toBe("working");
+      // Tool use for non-auto-approved tools (Bash) immediately shows as waiting
+      expect(status.status).toBe("waiting");
       expect(status.hasPendingToolUse).toBe(true);
     });
 
@@ -212,22 +212,6 @@ describe("Session Tracking", () => {
       // Daemon reports "waiting" - UI will show as "idle" based on elapsed time
       expect(status.status).toBe("waiting");
       expect(status.lastActivityAt).toBe(oldTime);
-    });
-
-    it("should transition to waiting_for_approval after tool use timeout", async () => {
-      // Create entries from 20 seconds ago (past the 15s APPROVAL_TIMEOUT)
-      const oldTime = new Date(Date.now() - 20 * 1000).toISOString();
-      const userEntry = createUserEntry("Run a command", oldTime);
-      const assistantEntry = createAssistantEntry("I'll run that", oldTime, true); // has tool_use (Bash - not auto-approved)
-
-      await writeFile(TEST_LOG_FILE, userEntry + assistantEntry);
-
-      const { entries } = await tailJSONL(TEST_LOG_FILE, 0);
-      const status = deriveStatus(entries);
-
-      // After APPROVAL_TIMEOUT (15s), tool_use should transition to "waiting" (waiting_for_approval)
-      expect(status.status).toBe("waiting");
-      expect(status.hasPendingToolUse).toBe(true);
     });
   });
 
