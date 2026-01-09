@@ -92,26 +92,48 @@ For older Claude Code versions or sessions without hooks:
 - **60 seconds**: If no turn-end marker → `waiting_for_input`
 - **5 minutes**: No activity → `idle`
 
+## Setup
+
+### 1. Install dependencies
+
+```bash
+pnpm install
+```
+
+### 2. Configure PermissionRequest hook (recommended)
+
+For accurate "Needs Approval" detection, install the PermissionRequest hook:
+
+```bash
+cd packages/daemon
+pnpm run setup
+```
+
+This adds a hook to `~/.claude/settings.json` that notifies the daemon when Claude Code is waiting for user permission. Without this hook, the daemon uses heuristics based on tool names which may be less accurate.
+
+### 3. Set API key
+
+The daemon needs an Anthropic API key for AI summaries:
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+```
+
+### 4. Start the app
+
+```bash
+pnpm start
+```
+
 ## Development
 
 ```bash
-# Install dependencies
-pnpm install
-
 # Start both daemon and UI
 pnpm start
 
 # Or run separately:
 pnpm serve  # Start daemon on port 4450
 pnpm dev    # Start UI dev server
-```
-
-## Environment Variables
-
-The daemon needs an Anthropic API key for AI summaries:
-
-```bash
-export ANTHROPIC_API_KEY=sk-ant-...
 ```
 
 ## Dependencies
