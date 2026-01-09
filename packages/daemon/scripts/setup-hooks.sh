@@ -39,8 +39,8 @@ if jq -e '.hooks.PermissionRequest' "$SETTINGS_FILE" > /dev/null 2>&1; then
     exit 0
 fi
 
-# Add the PermissionRequest hook
-jq --arg hook "$HOOK_SCRIPT" '.hooks.PermissionRequest = [{"type": "command", "command": $hook}]' "$SETTINGS_FILE" > "$SETTINGS_FILE.tmp"
+# Add the PermissionRequest hook with new format (matcher + hooks array)
+jq --arg hook "$HOOK_SCRIPT" '.hooks.PermissionRequest = [{"matcher": {}, "hooks": [{"type": "command", "command": $hook}]}]' "$SETTINGS_FILE" > "$SETTINGS_FILE.tmp"
 mv "$SETTINGS_FILE.tmp" "$SETTINGS_FILE"
 
 echo "Added PermissionRequest hook to $SETTINGS_FILE"
