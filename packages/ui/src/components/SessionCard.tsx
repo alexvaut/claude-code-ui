@@ -1,4 +1,5 @@
 import { Card, Flex, Text, Code, Box, HoverCard, Badge, Heading } from "@radix-ui/themes";
+import Markdown from "react-markdown";
 import type { Session, CIStatus } from "../data/schema";
 
 interface SessionCardProps {
@@ -200,21 +201,55 @@ export function SessionCard({ session, disableHover }: SessionCardProps) {
           >
             {session.recentOutput?.length > 0 ? (
               session.recentOutput.map((output, i) => (
-                <Text
+                <Box
                   key={i}
-                  as="p"
-                  size="1"
-                  mb="2"
-                  style={{
-                    color: getRoleColor(output.role),
-                    whiteSpace: "pre-wrap",
-                    margin: 0,
-                    marginBottom: i < session.recentOutput.length - 1 ? "8px" : 0,
-                  }}
+                  mb={i < session.recentOutput.length - 1 ? "2" : "0"}
+                  style={{ color: getRoleColor(output.role) }}
+                  className="markdown-content"
                 >
-                  {getRolePrefix(output.role)}
-                  {output.content}
-                </Text>
+                  {getRolePrefix(output.role) && (
+                    <Text size="1" weight="medium">{getRolePrefix(output.role)}</Text>
+                  )}
+                  <Markdown
+                    components={{
+                      // Override default elements to use Radix styling
+                      p: ({ children }) => <Text as="p" size="1" mb="2">{children}</Text>,
+                      code: ({ children, className }) => {
+                        const isBlock = className?.includes("language-");
+                        return isBlock ? (
+                          <Box
+                            as="pre"
+                            p="2"
+                            my="2"
+                            style={{
+                              backgroundColor: "var(--gray-3)",
+                              borderRadius: "var(--radius-2)",
+                              overflow: "auto",
+                              fontSize: "var(--font-size-1)",
+                            }}
+                          >
+                            <code>{children}</code>
+                          </Box>
+                        ) : (
+                          <Code size="1">{children}</Code>
+                        );
+                      },
+                      ul: ({ children }) => <Box as="ul" pl="4" mb="2">{children}</Box>,
+                      ol: ({ children }) => <Box as="ol" pl="4" mb="2">{children}</Box>,
+                      li: ({ children }) => <Text as="li" size="1">{children}</Text>,
+                      h1: ({ children }) => <Heading size="3" mb="2">{children}</Heading>,
+                      h2: ({ children }) => <Heading size="2" mb="2">{children}</Heading>,
+                      h3: ({ children }) => <Heading size="1" mb="1">{children}</Heading>,
+                      a: ({ href, children }) => (
+                        <a href={href} target="_blank" rel="noopener noreferrer" style={{ color: "var(--accent-11)" }}>
+                          {children}
+                        </a>
+                      ),
+                    }}
+                  >
+                    {output.content}
+                  </Markdown>
+                </Box>
               ))
             ) : (
               <Text size="1" color="gray">
