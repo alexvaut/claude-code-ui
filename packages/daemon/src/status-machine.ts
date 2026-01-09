@@ -124,6 +124,33 @@ export const statusMachine = setup({
             context.hasPendingToolUse = remaining.length > 0;
           },
         },
+        USER_PROMPT: {
+          // User started new turn - clears pending approval
+          target: "working",
+          actions: ({ context, event }) => {
+            context.lastActivityAt = event.timestamp;
+            context.messageCount += 1;
+            context.hasPendingToolUse = false;
+            context.pendingToolIds = [];
+          },
+        },
+        TURN_END: {
+          // Turn ended without approval (e.g., session closed)
+          target: "waiting_for_input",
+          actions: ({ context, event }) => {
+            context.lastActivityAt = event.timestamp;
+            context.hasPendingToolUse = false;
+            context.pendingToolIds = [];
+          },
+        },
+        STALE_TIMEOUT: {
+          // Approval pending too long - likely already resolved
+          target: "waiting_for_input",
+          actions: ({ context }) => {
+            context.hasPendingToolUse = false;
+            context.pendingToolIds = [];
+          },
+        },
       },
     },
     waiting_for_input: {
@@ -246,11 +273,16 @@ export function deriveStatusFromMachine(entries: LogEntry[]): {
 
   const STALE_TIMEOUT_MS = 15 * 1000; // 15 seconds - detect stale sessions quickly
 
-  // Apply stale timeout if working with no pending tool use for too long
+  // Apply stale timeout for stale working or waiting_for_approval states
   // (idle status is handled by the UI based on elapsed time)
-  if (stateValue === "working" && !context.hasPendingToolUse && timeSinceActivity > STALE_TIMEOUT_MS) {
-    // Stale without tool use - probably turn ended without marker
-    actor.send({ type: "STALE_TIMEOUT" });
+  if (timeSinceActivity > STALE_TIMEOUT_MS) {
+    if (stateValue === "working" && !context.hasPendingToolUse) {
+      // Stale working without tool use - probably turn ended without marker
+      actor.send({ type: "STALE_TIMEOUT" });
+    } else if (stateValue === "waiting_for_approval") {
+      // Stale waiting for approval - tool probably already ran
+      actor.send({ type: "STALE_TIMEOUT" });
+    }
   }
 
   // Get final state
