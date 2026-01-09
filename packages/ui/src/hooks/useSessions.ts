@@ -12,7 +12,9 @@ import type { Session } from "../data/schema";
 export function useSessions() {
   const db = getSessionsDbSync();
 
-  const query = useLiveQuery(
+  // Note: Type cast needed due to @tanstack/react-db generic type issues
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const query = useLiveQuery<any>(
     (q) =>
       q
         .from({ sessions: db.collections.sessions })
@@ -23,7 +25,7 @@ export function useSessions() {
   // Transform to array of sessions
   // The query.data is a Map where values are the session objects directly
   const sessions: Session[] = query?.data
-    ? Array.from(query.data.values())
+    ? (Array.from(query.data.values()) as Session[])
     : [];
 
   return {

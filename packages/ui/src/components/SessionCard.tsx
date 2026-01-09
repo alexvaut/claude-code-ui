@@ -1,5 +1,6 @@
-import { Card, Flex, Text, Code, Box, HoverCard, Badge, Heading, Separator } from "@radix-ui/themes";
+import { Card, Flex, Text, Code, Box, HoverCard, Badge, Heading, Separator, Blockquote } from "@radix-ui/themes";
 import Markdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
 
@@ -220,6 +221,7 @@ export function SessionCard({ session, disableHover }: SessionCardProps) {
                     </>
                   )}
                   <Markdown
+                    remarkPlugins={[remarkGfm]}
                     components={{
                       p: ({ children }) => <Text as="p" size="1" mb="4">{children}</Text>,
                       code: ({ className, children }) => {
@@ -239,12 +241,21 @@ export function SessionCard({ session, disableHover }: SessionCardProps) {
                         );
                       },
                       pre: ({ children }) => <Box mb="4">{children}</Box>,
-                      ul: ({ children }) => <ul style={{ paddingLeft: "var(--space-4)", marginBottom: "var(--space-4)" }}>{children}</ul>,
-                      ol: ({ children }) => <ol style={{ paddingLeft: "var(--space-4)", marginBottom: "var(--space-4)" }}>{children}</ol>,
-                      li: ({ children }) => <Text as="li" mb="2" size="1">{children}</Text>,
+                      ul: ({ children }) => (
+                        <ul style={{ paddingLeft: "var(--space-5)", marginBottom: "var(--space-4)", listStyleType: "disc" }}>
+                          {children}
+                        </ul>
+                      ),
+                      ol: ({ children }) => (
+                        <ol style={{ paddingLeft: "var(--space-5)", marginBottom: "var(--space-4)", listStyleType: "decimal" }}>
+                          {children}
+                        </ol>
+                      ),
+                      li: ({ children }) => <li style={{ marginBottom: "var(--space-1)", fontSize: "var(--font-size-1)" }}>{children}</li>,
                       h1: ({ children }) => <Heading size="3" mb="4">{children}</Heading>,
                       h2: ({ children }) => <Heading size="2" mb="4">{children}</Heading>,
                       h3: ({ children }) => <Heading size="1" mb="4">{children}</Heading>,
+                      blockquote: ({ children }) => <Blockquote size="1" mb="4">{children}</Blockquote>,
                       a: ({ href, children }) => (
                         <a href={href} target="_blank" rel="noopener noreferrer">
                           {children}
