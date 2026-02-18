@@ -1,2 +1,85 @@
-Instructions
-- Always verify with MCP playwright the UI changes, put screenshots in screenshots folder with number prefix `001-panels.png` 
+# Claude Code Session Tracker
+
+A real-time Kanban dashboard for monitoring Claude Code sessions across projects.
+
+## Architecture
+
+pnpm monorepo with two packages:
+
+- **`packages/daemon`** — Node.js backend that watches `~/.claude/projects/**/*.jsonl`, derives session status via XState state machine, and publishes state over `@durable-streams/server` (port 4450)
+- **`packages/ui`** — React 19 + Vite 7 frontend that subscribes to the daemon stream via `@tanstack/react-db` and displays sessions in a Kanban board grouped by Git repo
+
+## Getting Started
+
+```sh
+pnpm install        # install deps
+pnpm start          # run daemon + UI dev server concurrently
+pnpm setup          # install Claude hooks for session signals
+```
+
+## Key Commands
+
+| Command | Description |
+|---------|-------------|
+| `pnpm start` | Run daemon + UI concurrently |
+| `pnpm dev` | UI dev server only |
+| `pnpm serve` | Daemon only |
+| `pnpm --filter @claude-code-ui/daemon test` | Run daemon tests (vitest) |
+| `pnpm lint` | Lint UI (ESLint flat config) |
+
+## Tech Stack
+
+| Layer | Tech |
+|-------|------|
+| Package manager | pnpm 10 with workspaces |
+| UI framework | React 19, Vite 7, TypeScript 5.9 |
+| Routing | TanStack Router (file-based, `/packages/ui/src/routes/`) |
+| State / data | `@tanstack/db` + `@tanstack/react-db` via `@durable-streams` — no Redux/Zustand |
+| UI components | Radix UI Themes v3 (dark theme, violet accent) |
+| Daemon runtime | tsx (dev), tsc → `dist/` (prod) |
+| Status engine | XState v5 state machine |
+| Validation | Zod v4 (schemas duplicated in both packages) |
+| Testing | Vitest (daemon only, no UI tests) |
+
+## Code Conventions
+
+### General
+- TypeScript strict mode in both packages
+- Named imports; `type` keyword for type-only imports
+- PascalCase for components/types, camelCase for functions/variables/hooks
+- ESM throughout — daemon uses `.js` extensions on relative imports; UI does not (bundler mode)
+
+### UI
+- Use **Radix UI Themes** components exclusively — no plain HTML elements
+- Style with Radix props (`size`, `color`, `variant`) and CSS custom properties (`var(--grass-3)`, `var(--radius-4)`) — avoid inline styles
+- Query data with `useLiveQuery` from `@tanstack/react-db` (`.from()`, `.orderBy()`) — never filter in JS
+- DB singleton via `getSessionsDb()` (async init) / `getSessionsDbSync()` (after init) in `src/data/sessionsDb.ts`
+- File-based routing in `src/routes/`; route loaders initialize DB before render
+
+### Daemon
+- `SessionWatcher` (EventEmitter) in `src/watcher.ts` is the core; it drives `StreamServer` in `src/server.ts`
+- Status derived by XState machine (`src/status-machine.ts`): states are `working`, `waiting_for_approval`, `waiting_for_input`
+- Hook signals (`~/.claude/session-signals/*.json`) are authoritative and override JSONL-derived status
+- JSONL parsed incrementally via `tailJSONL()` in `src/parser.ts`
+- AI summaries generated with `@anthropic-ai/sdk` (Claude Sonnet) in `src/summarizer.ts`
+- PR/CI status polled via `gh` CLI in `src/github.ts`
+
+## Key Files
+
+| File | Purpose |
+|------|---------|
+| `packages/daemon/src/serve.ts` | Daemon entry point |
+| `packages/daemon/src/watcher.ts` | File watcher + session tracking |
+| `packages/daemon/src/status-machine.ts` | XState status machine |
+| `packages/daemon/src/schema.ts` | Zod schemas + durable streams state schema |
+| `packages/daemon/src/server.ts` | Stream server publishing |
+| `packages/ui/src/main.tsx` | React entry point |
+| `packages/ui/src/routes/__root.tsx` | Root layout (Theme, header) |
+| `packages/ui/src/routes/index.tsx` | Main Kanban page |
+| `packages/ui/src/data/sessionsDb.ts` | StreamDB singleton |
+| `packages/ui/src/data/schema.ts` | UI-side Zod schemas (mirrors daemon) |
+| `packages/ui/src/components/SessionCard.tsx` | Session card component |
+
+## Verification
+
+- Always verify UI changes with MCP Playwright — save screenshots to `screenshots/` with numbered prefix (e.g. `001-panels.png`)

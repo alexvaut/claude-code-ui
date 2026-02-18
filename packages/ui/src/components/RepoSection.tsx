@@ -1,5 +1,7 @@
-import { Box, Flex, Heading, Link, Text, Separator } from "@radix-ui/themes";
+import { Box, Flex, Heading, IconButton, Link, Text, Separator, Tooltip } from "@radix-ui/themes";
 import { KanbanColumn } from "./KanbanColumn";
+import { VSCodeIcon } from "./VSCodeIcon";
+import { toVSCodeUri } from "../lib/vscodeUri";
 import type { Session, SessionStatus } from "../data/schema";
 
 const IDLE_TIMEOUT_MS = 60 * 60 * 1000; // 1 hour - match daemon setting
@@ -51,6 +53,13 @@ export function RepoSection({ repoId, repoUrl, sessions, activityScore }: RepoSe
             displayName
           )}
         </Heading>
+        <Tooltip content="Open in VS Code">
+          <IconButton asChild size="1" variant="ghost" color="gray">
+            <a href={toVSCodeUri(repoId)} aria-label="Open in VS Code">
+              <VSCodeIcon size={14} />
+            </a>
+          </IconButton>
+        </Tooltip>
         {isHot && (
           <Text size="2" color="orange">
             🔥

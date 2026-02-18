@@ -1,4 +1,6 @@
-import { Card, Flex, Text, Code, Box, HoverCard, Badge, Heading, Separator, Blockquote } from "@radix-ui/themes";
+import { Card, Flex, Text, Code, Box, HoverCard, Badge, Heading, IconButton, Link, Separator, Blockquote, Tooltip } from "@radix-ui/themes";
+import { VSCodeIcon, VSCODE_BLUE } from "./VSCodeIcon";
+import { toVSCodeUri } from "../lib/vscodeUri";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
@@ -122,9 +124,24 @@ export function SessionCard({ session, disableHover }: SessionCardProps) {
           <Flex direction="column" gap="4">
             {/* Header: directory and time */}
             <Flex justify="between" align="center">
-              <Text size="1" color="gray" style={{ fontFamily: "var(--code-font-family)" }}>
-                {dirPath}
-              </Text>
+              <Flex align="center" gap="1">
+                <Text size="1" color="gray" style={{ fontFamily: "var(--code-font-family)" }}>
+                  {dirPath}
+                </Text>
+                <Tooltip content="Open in VS Code">
+                  <IconButton
+                    asChild
+                    size="1"
+                    variant="ghost"
+                    color="gray"
+                    onClick={(e: React.MouseEvent) => e.stopPropagation()}
+                  >
+                    <a href={toVSCodeUri(session.cwd)} aria-label="Open in VS Code">
+                      <VSCodeIcon size={12} />
+                    </a>
+                  </IconButton>
+                </Tooltip>
+              </Flex>
               <Text size="1" color="gray">
                 {formatTimeAgo(session.lastActivityAt)}
               </Text>
@@ -151,7 +168,7 @@ export function SessionCard({ session, disableHover }: SessionCardProps) {
               </Text>
             )}
 
-            {/* Footer: branch/PR info and message count */}
+            {/* Footer: branch/PR info, message count, and VS Code link */}
             <Flex align="center" justify="between" gap="2">
               <Flex align="center" gap="2">
                 {session.pr ? (
@@ -174,9 +191,23 @@ export function SessionCard({ session, disableHover }: SessionCardProps) {
                   </Code>
                 ) : null}
               </Flex>
-              <Text size="1" color="gray">
-                {session.messageCount} msgs
-              </Text>
+              <Flex align="center" gap="3">
+                <Text size="1" color="gray">
+                  {session.messageCount} msgs
+                </Text>
+                <Tooltip content="Open in VS Code">
+                  <IconButton
+                    asChild
+                    size="1"
+                    variant="ghost"
+                    onClick={(e: React.MouseEvent) => e.stopPropagation()}
+                  >
+                    <a href={toVSCodeUri(session.cwd)} aria-label="Open in VS Code">
+                      <VSCodeIcon size={18} color={VSCODE_BLUE} />
+                    </a>
+                  </IconButton>
+                </Tooltip>
+              </Flex>
             </Flex>
           </Flex>
         </Card>
@@ -311,10 +342,25 @@ export function SessionCard({ session, disableHover }: SessionCardProps) {
           )}
 
           {/* Footer */}
-          <Flex justify="between">
-            <Text size="1" color="gray">
-              {session.cwd.replace(/^\/Users\/\w+\//, "~/")}
-            </Text>
+          <Flex justify="between" align="center">
+            <Flex align="center" gap="1">
+              <Link
+                href={toVSCodeUri(session.cwd)}
+                size="1"
+                color="gray"
+                highContrast
+                style={{ fontFamily: "var(--code-font-family)" }}
+              >
+                {session.cwd.replace(/^\/Users\/\w+\//, "~/")}
+              </Link>
+              <Tooltip content="Open in VS Code">
+                <IconButton asChild size="1" variant="ghost" color="gray">
+                  <a href={toVSCodeUri(session.cwd)} aria-label="Open in VS Code">
+                    <VSCodeIcon size={12} />
+                  </a>
+                </IconButton>
+              </Tooltip>
+            </Flex>
             <Text size="1" color="gray">
               {session.sessionId.slice(0, 8)}
             </Text>
