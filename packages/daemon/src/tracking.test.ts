@@ -8,11 +8,13 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdir, writeFile, rm, appendFile } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
+import { execFileSync } from "node:child_process";
 import { SessionWatcher } from "./watcher.js";
 import { deriveStatus } from "./status.js";
 import { tailJSONL, extractMetadata } from "./parser.js";
 
 const TEST_DIR = path.join(os.homedir(), ".claude", "projects", "-test-e2e-session");
+const SIGNALS_DIR = path.join(os.homedir(), ".claude", "session-signals");
 
 // Generate unique IDs per test run to avoid conflicts
 function getTestSessionId(): string {
@@ -315,5 +317,177 @@ describe("Session Tracking", () => {
       // Should have at least 2 messages (user prompts)
       expect(lastMessageCount).toBeGreaterThanOrEqual(2);
     });
+  });
+
+  describe("Permission Signal Debounce", () => {
+    let permissionFile: string;
+
+    beforeEach(async () => {
+      await mkdir(SIGNALS_DIR, { recursive: true });
+      permissionFile = path.join(SIGNALS_DIR, `${TEST_SESSION_ID}.permission.json`);
+    });
+
+    afterEach(async () => {
+      // Clean up signal file if it still exists
+      await rm(permissionFile, { force: true });
+    });
+
+    it("should NOT show 'Needs Approval' when permission resolves within debounce window", async () => {
+      const watcher = new SessionWatcher({ debounceMs: 50, permissionDelayMs: 1000 });
+
+      const events: Array<{ type: string; status: string; hasPendingToolUse: boolean }> = [];
+      watcher.on("session", (event) => {
+        if (event.session.sessionId === TEST_SESSION_ID) {
+          events.push({
+            type: event.type,
+            status: event.session.status.status,
+            hasPendingToolUse: event.session.status.hasPendingToolUse,
+          });
+        }
+      });
+
+      await watcher.start();
+
+      // Create session file (status: working)
+      await writeFile(TEST_LOG_FILE, createUserEntry("Do something in plan mode"));
+      await new Promise((r) => setTimeout(r, 1000));
+
+      // Write permission signal (simulating auto-approved tool like EnterPlanMode)
+      await writeFile(permissionFile, JSON.stringify({
+        session_id: TEST_SESSION_ID,
+        tool_name: "EnterPlanMode",
+        pending_since: new Date().toISOString(),
+      }));
+
+      // Wait briefly (well within debounce window)
+      await new Promise((r) => setTimeout(r, 200));
+
+      // Remove permission (simulating quick auto-approval)
+      await rm(permissionFile, { force: true });
+
+      // Wait for watcher to process the removal
+      await new Promise((r) => setTimeout(r, 500));
+
+      watcher.stop();
+      await new Promise((r) => setTimeout(r, 100));
+
+      // No event should have hasPendingToolUse: true — debounce prevented the flicker
+      const approvalEvents = events.filter(e => e.hasPendingToolUse);
+      expect(approvalEvents).toHaveLength(0);
+    });
+
+    it("should show 'Needs Approval' when permission persists past debounce window", async () => {
+      const watcher = new SessionWatcher({ debounceMs: 50, permissionDelayMs: 1000 });
+
+      const events: Array<{ type: string; status: string; hasPendingToolUse: boolean }> = [];
+      watcher.on("session", (event) => {
+        if (event.session.sessionId === TEST_SESSION_ID) {
+          events.push({
+            type: event.type,
+            status: event.session.status.status,
+            hasPendingToolUse: event.session.status.hasPendingToolUse,
+          });
+        }
+      });
+
+      await watcher.start();
+
+      // Create session file (status: working)
+      await writeFile(TEST_LOG_FILE, createUserEntry("Run a bash command"));
+      await new Promise((r) => setTimeout(r, 1000));
+
+      // Write permission signal (simulating blocking tool like Bash)
+      await writeFile(permissionFile, JSON.stringify({
+        session_id: TEST_SESSION_ID,
+        tool_name: "Bash",
+        pending_since: new Date().toISOString(),
+      }));
+
+      // Wait past the debounce window (1000ms delay + buffer)
+      await new Promise((r) => setTimeout(r, 2000));
+
+      watcher.stop();
+      await new Promise((r) => setTimeout(r, 100));
+
+      // Should have an event with hasPendingToolUse: true after the debounce period
+      const approvalEvents = events.filter(e => e.hasPendingToolUse);
+      expect(approvalEvents.length).toBeGreaterThan(0);
+      expect(approvalEvents[0].status).toBe("waiting");
+    });
+  });
+
+  describe("Claude -p E2E", () => {
+    it("should track a real claude session with no false 'Needs Approval'", async () => {
+      const watcher = new SessionWatcher({ debounceMs: 50, permissionDelayMs: 1000 });
+
+      // Track sessions that are newly created during this test (ignore pre-existing)
+      const newSessionIds = new Set<string>();
+      const events: Array<{ type: string; sessionId: string; status: string; hasPendingToolUse: boolean }> = [];
+      watcher.on("session", (event) => {
+        if (event.type === "created") {
+          newSessionIds.add(event.session.sessionId);
+        }
+        if (newSessionIds.has(event.session.sessionId)) {
+          events.push({
+            type: event.type,
+            sessionId: event.session.sessionId,
+            status: event.session.status.status,
+            hasPendingToolUse: event.session.status.hasPendingToolUse,
+          });
+        }
+      });
+
+      await watcher.start();
+
+      // Wait for initial scan to complete so existing sessions are not counted as "created"
+      await new Promise((r) => setTimeout(r, 3000));
+      newSessionIds.clear();
+      events.length = 0;
+
+      // Find claude CLI — try common locations
+      let claudePath = "claude";
+      const candidatePaths = [
+        path.join(os.homedir(), ".local", "bin", "claude.exe"),
+        path.join(os.homedir(), ".local", "bin", "claude"),
+      ];
+      for (const candidate of candidatePaths) {
+        try {
+          const { statSync } = await import("node:fs");
+          if (statSync(candidate).isFile()) { claudePath = candidate; break; }
+        } catch { /* not found */ }
+      }
+
+      // Run claude -p with a simple prompt (no tool approval needed)
+      try {
+        // Unset CLAUDECODE to allow nested claude invocation in test
+        const env = { ...process.env };
+        delete env.CLAUDECODE;
+        execFileSync(claudePath, ["-p", "what is 2+2? reply with just the number"], {
+          timeout: 60000,
+          stdio: "pipe",
+          env,
+        });
+      } catch (err) {
+        // claude may not be available in CI — skip gracefully
+        watcher.stop();
+        await new Promise((r) => setTimeout(r, 100));
+        console.log("Skipping claude -p test: claude CLI not available", (err as Error).message);
+        return;
+      }
+
+      // Wait for all signals to be processed
+      await new Promise((r) => setTimeout(r, 3000));
+
+      watcher.stop();
+      await new Promise((r) => setTimeout(r, 100));
+
+      // Should have detected the new claude session
+      expect(newSessionIds.size).toBeGreaterThan(0);
+      expect(events.length).toBeGreaterThan(0);
+
+      // No event from the test session should have hasPendingToolUse
+      const approvalEvents = events.filter(e => e.hasPendingToolUse);
+      expect(approvalEvents).toHaveLength(0);
+    }, 90000); // Extended timeout for real claude call
   });
 });

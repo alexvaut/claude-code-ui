@@ -113,12 +113,15 @@ export class SessionWatcher extends EventEmitter {
   private taskSignals = new Map<string, Map<string, ActiveTask>>(); // sessionId → toolUseId → ActiveTask
   private compactingSignals = new Map<string, string>(); // sessionId → startedAt
   private debounceTimers = new Map<string, NodeJS.Timeout>();
+  private permissionTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private debounceMs: number;
+  private permissionDelayMs: number;
   private staleCheckInterval: NodeJS.Timeout | null = null;
 
-  constructor(options: { debounceMs?: number } = {}) {
+  constructor(options: { debounceMs?: number; permissionDelayMs?: number } = {}) {
     super();
     this.debounceMs = options.debounceMs ?? 200;
+    this.permissionDelayMs = options.permissionDelayMs ?? 3000;
   }
 
   /**
@@ -296,18 +299,28 @@ export class SessionWatcher extends EventEmitter {
         log("Watcher", `Pending permission for session ${sessionId}: ${permission.tool_name}`);
         this.pendingPermissions.set(sessionId, permission);
 
-        // Update session if it exists
-        const session = this.sessions.get(sessionId);
-        if (session) {
-          const previousStatus = session.status;
-          session.pendingPermission = permission;
-          session.status = {
-            ...session.status,
-            status: "waiting",
-            hasPendingToolUse: true,
-          };
-          this.emit("session", { type: "updated", session, previousStatus } satisfies SessionEvent);
-        }
+        // Cancel any existing debounce timer
+        const existingTimer = this.permissionTimers.get(sessionId);
+        if (existingTimer) clearTimeout(existingTimer);
+
+        // Debounce: only show "Needs Approval" if permission is still pending after delay.
+        // Auto-approved tools (e.g. EnterPlanMode) resolve quickly and never trigger the update.
+        this.permissionTimers.set(sessionId, setTimeout(() => {
+          this.permissionTimers.delete(sessionId);
+          if (!this.pendingPermissions.has(sessionId)) return;
+
+          const session = this.sessions.get(sessionId);
+          if (session) {
+            const previousStatus = session.status;
+            session.pendingPermission = permission;
+            session.status = {
+              ...session.status,
+              status: "waiting",
+              hasPendingToolUse: true,
+            };
+            this.emit("session", { type: "updated", session, previousStatus } satisfies SessionEvent);
+          }
+        }, this.permissionDelayMs));
       } else if (type === "stop") {
         const stopSignal = data as StopSignal;
         log("Watcher", `Stop signal for session ${sessionId}`);
@@ -441,6 +454,10 @@ export class SessionWatcher extends EventEmitter {
       }
     } else if (type === "permission") {
       this.pendingPermissions.delete(sessionId);
+      // Cancel debounce timer
+      const timer = this.permissionTimers.get(sessionId);
+      if (timer) { clearTimeout(timer); this.permissionTimers.delete(sessionId); }
+
       const session = this.sessions.get(sessionId);
       if (session && session.pendingPermission) {
         const previousStatus = session.status;
@@ -505,6 +522,12 @@ export class SessionWatcher extends EventEmitter {
       clearTimeout(timer);
     }
     this.debounceTimers.clear();
+
+    // Clear all permission debounce timers
+    for (const timer of this.permissionTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.permissionTimers.clear();
   }
 
   /**
@@ -514,6 +537,10 @@ export class SessionWatcher extends EventEmitter {
     if (!this.pendingPermissions.has(sessionId)) return;
 
     this.pendingPermissions.delete(sessionId);
+
+    // Cancel debounce timer
+    const timer = this.permissionTimers.get(sessionId);
+    if (timer) { clearTimeout(timer); this.permissionTimers.delete(sessionId); }
 
     // Try to delete the file
     try {
@@ -550,6 +577,9 @@ export class SessionWatcher extends EventEmitter {
     for (const session of this.sessions.values()) {
       // Check working sessions for stale timeout
       if (session.status.status === "working") {
+        // Hook signals are authoritative — skip stale check if working signal is active
+        if (session.hasWorkingSignal) continue;
+
         // Re-derive status which will apply STALE_TIMEOUT
         const newStatus = deriveStatus(session.entries);
 
@@ -780,8 +810,8 @@ export class SessionWatcher extends EventEmitter {
         // Session ended — worktree sessions go to "review", others to "idle"
         const endedStatus = gitInfo.isWorktree ? "review" : "idle";
         status = { ...status, status: endedStatus, hasPendingToolUse: false };
-      } else if (pendingPermission) {
-        // Waiting for permission approval
+      } else if (pendingPermission && !this.permissionTimers.has(sessionId)) {
+        // Waiting for permission approval (debounce period has passed)
         status = { ...status, status: "waiting", hasPendingToolUse: true };
       } else if (hasStopSig) {
         // Claude's turn ended — worktree sessions go to "review" (no interactive user), others wait
