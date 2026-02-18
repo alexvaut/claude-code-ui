@@ -216,6 +216,8 @@ export function logEntryToEvent(entry: LogEntry): StatusEvent | null {
       "Grep",           // Content search
       "TodoWrite",      // Todo list management
       "TaskOutput",     // Getting task output
+      "EnterPlanMode",  // Plan mode toggle
+      "ExitPlanMode",   // Plan mode toggle
       // Note: WebFetch, WebSearch, NotebookEdit, AskUserQuestion can require approval
       // depending on user configuration, so they're not auto-approved
     ]);

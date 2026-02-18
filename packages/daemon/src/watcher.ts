@@ -38,6 +38,31 @@ export interface WorkingSignal {
   working_since: string;
 }
 
+export interface TaskSignal {
+  session_id: string;
+  tool_use_id: string;
+  agent_type: string;
+  description: string;
+  started_at: string;
+}
+
+export interface CompactingSignal {
+  session_id: string;
+  started_at: string;
+}
+
+export interface ActiveTask {
+  toolUseId: string;
+  agentType: string;
+  description: string;
+  startedAt: string;
+}
+
+export interface TodoProgress {
+  total: number;
+  completed: number;
+}
+
 export interface SessionState {
   sessionId: string;
   filepath: string;
@@ -65,6 +90,10 @@ export interface SessionState {
   hasStopSignal?: boolean;
   // True when SessionEnd hook has fired (session closed)
   hasEndedSignal?: boolean;
+  // Active subagents spawned via Task tool
+  activeTasks: ActiveTask[];
+  // Todo progress from TodoWrite
+  todoProgress: TodoProgress | null;
 }
 
 export interface SessionEvent {
@@ -81,6 +110,8 @@ export class SessionWatcher extends EventEmitter {
   private workingSignals = new Map<string, WorkingSignal>();
   private stopSignals = new Map<string, StopSignal>();
   private endedSignals = new Map<string, SessionEndSignal>();
+  private taskSignals = new Map<string, Map<string, ActiveTask>>(); // sessionId → toolUseId → ActiveTask
+  private compactingSignals = new Map<string, string>(); // sessionId → startedAt
   private debounceTimers = new Map<string, NodeJS.Timeout>();
   private debounceMs: number;
   private staleCheckInterval: NodeJS.Timeout | null = null;
@@ -205,10 +236,23 @@ export class SessionWatcher extends EventEmitter {
 
   /**
    * Parse signal filename to extract session ID and signal type.
-   * Format: <session_id>.<type>.json (e.g., abc123.permission.json)
+   * Formats:
+   *   <session_id>.<type>.json (e.g., abc123.permission.json)
+   *   <session_id>.task.<tool_use_id>.json (e.g., abc123.task.toolu_xyz.json)
+   *   <session_id>.compacting.json
    */
-  private parseSignalFilename(filepath: string): { sessionId: string; type: "working" | "permission" | "stop" | "ended" } | null {
+  private parseSignalFilename(filepath: string): { sessionId: string; type: "working" | "permission" | "stop" | "ended" | "task" | "compacting"; toolUseId?: string } | null {
     const filename = filepath.replace(/\\/g, "/").split("/").pop() || "";
+
+    // Match task signals: <session_id>.task.<tool_use_id>.json
+    const taskMatch = filename.match(/^(.+)\.task\.(.+)\.json$/);
+    if (taskMatch) return { sessionId: taskMatch[1], type: "task", toolUseId: taskMatch[2] };
+
+    // Match compacting signals: <session_id>.compacting.json
+    const compactMatch = filename.match(/^(.+)\.compacting\.json$/);
+    if (compactMatch) return { sessionId: compactMatch[1], type: "compacting" };
+
+    // Match standard signals
     const match = filename.match(/^(.+)\.(working|permission|stop|ended)\.json$/);
     if (!match) return null;
     return { sessionId: match[1], type: match[2] as "working" | "permission" | "stop" | "ended" };
@@ -312,10 +356,71 @@ export class SessionWatcher extends EventEmitter {
           };
           this.emit("session", { type: "updated", session, previousStatus } satisfies SessionEvent);
         }
+      } else if (type === "task" && parsed.toolUseId) {
+        const taskSignal = data as TaskSignal;
+        log("Watcher", `Task signal for session ${sessionId}: ${taskSignal.agent_type || "unknown"} - ${taskSignal.description || ""}`);
+
+        // Store in task signals map
+        let sessionTasks = this.taskSignals.get(sessionId);
+        if (!sessionTasks) {
+          sessionTasks = new Map();
+          this.taskSignals.set(sessionId, sessionTasks);
+        }
+        const activeTask: ActiveTask = {
+          toolUseId: parsed.toolUseId,
+          agentType: taskSignal.agent_type || "unknown",
+          description: taskSignal.description || "task",
+          startedAt: taskSignal.started_at || new Date().toISOString(),
+        };
+        sessionTasks.set(parsed.toolUseId, activeTask);
+
+        // Update session
+        const session = this.sessions.get(sessionId);
+        if (session) {
+          session.activeTasks = this.getActiveTasksForSession(sessionId);
+          this.emit("session", { type: "updated", session } satisfies SessionEvent);
+        }
+      } else if (type === "compacting") {
+        const compactSignal = data as CompactingSignal;
+        log("Watcher", `Compacting signal for session ${sessionId}`);
+        this.compactingSignals.set(sessionId, compactSignal.started_at || new Date().toISOString());
+
+        // Update session
+        const session = this.sessions.get(sessionId);
+        if (session) {
+          session.activeTasks = this.getActiveTasksForSession(sessionId);
+          this.emit("session", { type: "updated", session } satisfies SessionEvent);
+        }
       }
     } catch {
       // Ignore parse errors
     }
+  }
+
+  /**
+   * Build the activeTasks array for a session from hook signals.
+   */
+  private getActiveTasksForSession(sessionId: string): ActiveTask[] {
+    const tasks: ActiveTask[] = [];
+
+    // Add task signals
+    const sessionTasks = this.taskSignals.get(sessionId);
+    if (sessionTasks) {
+      tasks.push(...sessionTasks.values());
+    }
+
+    // Add compacting as a synthetic task
+    const compactingStartedAt = this.compactingSignals.get(sessionId);
+    if (compactingStartedAt) {
+      tasks.push({
+        toolUseId: "compacting",
+        agentType: "System",
+        description: "Compacting context",
+        startedAt: compactingStartedAt,
+      });
+    }
+
+    return tasks;
   }
 
   /**
@@ -354,6 +459,26 @@ export class SessionWatcher extends EventEmitter {
       const session = this.sessions.get(sessionId);
       if (session) {
         session.hasEndedSignal = false;
+      }
+    } else if (type === "task" && parsed.toolUseId) {
+      const sessionTasks = this.taskSignals.get(sessionId);
+      if (sessionTasks) {
+        sessionTasks.delete(parsed.toolUseId);
+        if (sessionTasks.size === 0) {
+          this.taskSignals.delete(sessionId);
+        }
+      }
+      const session = this.sessions.get(sessionId);
+      if (session) {
+        session.activeTasks = this.getActiveTasksForSession(sessionId);
+        this.emit("session", { type: "updated", session } satisfies SessionEvent);
+      }
+    } else if (type === "compacting") {
+      this.compactingSignals.delete(sessionId);
+      const session = this.sessions.get(sessionId);
+      if (session) {
+        session.activeTasks = this.getActiveTasksForSession(sessionId);
+        this.emit("session", { type: "updated", session } satisfies SessionEvent);
       }
     }
   }
@@ -478,6 +603,57 @@ export class SessionWatcher extends EventEmitter {
     this.debounceTimers.set(filepath, timer);
   }
 
+  /**
+   * Extract active tasks and todo progress from JSONL entries.
+   * Used as fallback when hook signals are not available.
+   */
+  private extractSessionInfo(entries: LogEntry[]): {
+    activeTasks: ActiveTask[];
+    todoProgress: TodoProgress | null;
+  } {
+    const pendingTaskIds = new Map<string, ActiveTask>();
+    let latestTodos: Array<{ content: string; status: string }> | null = null;
+
+    for (const entry of entries) {
+      if (entry.type === "assistant") {
+        for (const block of entry.message.content) {
+          if (block.type === "tool_use" && block.name === "Task") {
+            const input = block.input as Record<string, unknown>;
+            pendingTaskIds.set(block.id, {
+              toolUseId: block.id,
+              agentType: (input.subagent_type as string) || "unknown",
+              description: (input.description as string) || "task",
+              startedAt: entry.timestamp,
+            });
+          }
+        }
+      } else if (entry.type === "user") {
+        // Check for tool_results that resolve Task calls
+        if (Array.isArray(entry.message.content)) {
+          for (const block of entry.message.content) {
+            if (block.type === "tool_result") {
+              pendingTaskIds.delete(block.tool_use_id);
+            }
+          }
+        }
+        // Check for todos
+        if (entry.todos && entry.todos.length > 0) {
+          latestTodos = entry.todos;
+        }
+      }
+    }
+
+    return {
+      activeTasks: Array.from(pendingTaskIds.values()),
+      todoProgress: latestTodos
+        ? {
+            total: latestTodos.length,
+            completed: latestTodos.filter((t) => t.status === "completed").length,
+          }
+        : null,
+    };
+  }
+
   private async handleFile(
     filepath: string,
     eventType: "add" | "change"
@@ -581,6 +757,19 @@ export class SessionWatcher extends EventEmitter {
       let status = deriveStatus(allEntries);
       const previousStatus = existingSession?.status;
 
+      // Extract active tasks and todo progress from entries (JSONL fallback)
+      const sessionInfo = this.extractSessionInfo(allEntries);
+
+      // If compacting signal exists and new entries arrived, compaction is done
+      if (newEntries.length > 0 && this.compactingSignals.has(sessionId)) {
+        this.compactingSignals.delete(sessionId);
+        try {
+          await unlink(join(SIGNALS_DIR, `${sessionId}.compacting.json`));
+        } catch {
+          // File may already be deleted
+        }
+      }
+
       // Hook signals are authoritative for status - override JSONL-derived status
       const pendingPermission = this.pendingPermissions.get(sessionId);
       const hasWorkingSig = this.workingSignals.has(sessionId);
@@ -626,6 +815,14 @@ export class SessionWatcher extends EventEmitter {
         hasWorkingSignal: hasWorkingSig,
         hasStopSignal: hasStopSig,
         hasEndedSignal: hasEndedSig,
+        // Hook signals are authoritative for active tasks.
+        // JSONL fallback only reports tasks when session is working — if the turn
+        // ended (waiting/idle), all tasks completed even if tool_result matching
+        // failed (e.g., due to context compaction rewriting entries).
+        activeTasks: this.taskSignals.has(sessionId) || this.compactingSignals.has(sessionId)
+          ? this.getActiveTasksForSession(sessionId)
+          : status.status === "working" ? sessionInfo.activeTasks : [],
+        todoProgress: sessionInfo.todoProgress,
       };
 
       // Store session
@@ -635,13 +832,18 @@ export class SessionWatcher extends EventEmitter {
       const isNew = !existingSession;
       const hasStatusChange = statusChanged(previousStatus, status);
       const hasNewMessages = existingSession && status.messageCount > existingSession.status.messageCount;
+      const infoChanged = existingSession && (
+        existingSession.activeTasks.length !== session.activeTasks.length ||
+        existingSession.todoProgress?.completed !== session.todoProgress?.completed ||
+        existingSession.todoProgress?.total !== session.todoProgress?.total
+      );
 
       if (isNew) {
         this.emit("session", {
           type: "created",
           session,
         } satisfies SessionEvent);
-      } else if (hasStatusChange || hasNewMessages || branchChanged) {
+      } else if (hasStatusChange || hasNewMessages || branchChanged || infoChanged) {
         this.emit("session", {
           type: "updated",
           session,

@@ -139,6 +139,20 @@ export function SessionCard({ session, disableHover }: SessionCardProps) {
               {session.goal || session.originalPrompt.slice(0, 50)}
             </Heading>
 
+            {/* Active agents */}
+            {session.activeTasks.length > 0 && (
+              <Flex direction="column" gap="1">
+                {session.activeTasks.map((task) => (
+                  <Flex key={task.toolUseId} align="center" gap="2">
+                    <Badge color="iris" variant="soft" size="1">
+                      {task.agentType}
+                    </Badge>
+                    <Text size="1" color="gray">{task.description}</Text>
+                  </Flex>
+                ))}
+              </Flex>
+            )}
+
             {/* Secondary: current activity (pending tool or summary) */}
             {showPendingTool ? (
               <Flex align="center" gap="2">
@@ -180,6 +194,11 @@ export function SessionCard({ session, disableHover }: SessionCardProps) {
                 <Text size="1" color="gray">
                   {session.messageCount} msgs
                 </Text>
+                {session.todoProgress && (
+                  <Text size="1" color="gray">
+                    {session.todoProgress.completed}/{session.todoProgress.total} tasks
+                  </Text>
+                )}
                 {session.isWorktree && session.gitRootPath ? (
                   <Flex align="center" gap="1">
                     <Tooltip content={`Open repo: ${session.gitRootPath}`}>

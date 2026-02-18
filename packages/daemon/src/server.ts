@@ -139,6 +139,8 @@ export class StreamServer {
       summary,
       recentOutput: extractRecentOutput(sessionState.entries),
       pr,
+      activeTasks: sessionState.activeTasks,
+      todoProgress: sessionState.todoProgress,
     };
 
     // Create the event using the schema helpers
@@ -190,6 +192,8 @@ export class StreamServer {
       summary,
       recentOutput: extractRecentOutput(sessionState.entries),
       pr,
+      activeTasks: sessionState.activeTasks,
+      todoProgress: sessionState.todoProgress,
     };
 
     const event = sessionsStateSchema.sessions.update({ value: session });
@@ -264,6 +268,12 @@ function formatToolUse(tool: string, input: Record<string, unknown>): string {
       return `📁 Finding files: ${input.pattern}`;
     case "Task":
       return `🤖 Spawning agent: ${(input.description as string) || "task"}`;
+    case "EnterPlanMode":
+      return "📋 Entering plan mode";
+    case "ExitPlanMode":
+      return "📋 Exiting plan mode";
+    case "TodoWrite":
+      return "📝 Updating task list";
     default:
       return `🔧 ${tool}`;
   }

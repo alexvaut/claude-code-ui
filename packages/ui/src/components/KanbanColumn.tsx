@@ -7,11 +7,12 @@ interface KanbanColumnProps {
   title: string;
   status: SessionStatus | "needs-approval";
   sessions: Session[];
-  color: "green" | "orange" | "yellow" | "cyan" | "gray";
+  color: "green" | "iris" | "orange" | "yellow" | "cyan" | "gray";
 }
 
 const headerClassMap = {
   green: "column-header-working",
+  iris: "column-header-tasking",
   orange: "column-header-approval",
   yellow: "column-header-waiting",
   cyan: "column-header-review",
@@ -52,6 +53,7 @@ export function KanbanColumn({ title, sessions, color }: KanbanColumnProps) {
 
   const colorMap = {
     green: "var(--grass-3)",
+    iris: "var(--iris-3)",
     orange: "var(--orange-3)",
     yellow: "var(--amber-3)",
     cyan: "var(--cyan-3)",
@@ -60,6 +62,7 @@ export function KanbanColumn({ title, sessions, color }: KanbanColumnProps) {
 
   const countColorMap = {
     green: "grass" as const,
+    iris: "iris" as const,
     orange: "orange" as const,
     yellow: "amber" as const,
     cyan: "cyan" as const,
@@ -75,7 +78,7 @@ export function KanbanColumn({ title, sessions, color }: KanbanColumnProps) {
         overflow: "hidden",
         backgroundColor: colorMap[color],
         borderRadius: "var(--radius-4)",
-        border: `1px solid var(--${{ green: "grass", orange: "orange", yellow: "amber", cyan: "cyan", gray: "slate" }[color]}-6)`,
+        border: `1px solid var(--${{ green: "grass", iris: "iris", orange: "orange", yellow: "amber", cyan: "cyan", gray: "slate" }[color]}-6)`,
       }}
       p="3"
     >

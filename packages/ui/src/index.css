@@ -71,6 +71,10 @@ body {
   border-color: #06b6d4;
 }
 
+.column-header-tasking {
+  border-color: #818cf8;
+}
+
 .column-header-idle {
   border-color: #64748b;
 }

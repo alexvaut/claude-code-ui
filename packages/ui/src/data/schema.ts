@@ -58,6 +58,16 @@ export const SessionSchema = z.object({
   summary: z.string(), // Current activity summary
   recentOutput: z.array(RecentOutputSchema),
   pr: PRInfoSchema.nullable(), // Associated PR if branch has one
+  activeTasks: z.array(z.object({
+    toolUseId: z.string(),
+    agentType: z.string(),
+    description: z.string(),
+    startedAt: z.string(),
+  })),
+  todoProgress: z.object({
+    total: z.number(),
+    completed: z.number(),
+  }).nullable(),
 });
 export type Session = z.infer<typeof SessionSchema>;
 

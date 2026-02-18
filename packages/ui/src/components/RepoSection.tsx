@@ -31,14 +31,23 @@ interface RepoSectionProps {
 
 export function RepoSection({ repoId, repoUrl, sessions, activityScore }: RepoSectionProps) {
   // Use effective status to categorize sessions (accounts for time-based idle)
-  const working = sessions.filter((s) => getEffectiveStatus(s) === "working");
+  // Sessions with active tasks get pulled into "Tasking" column regardless of status
+  const tasking = sessions.filter(
+    (s) => s.activeTasks.length > 0 && getEffectiveStatus(s) !== "idle"
+  );
+  const taskingIds = new Set(tasking.map((s) => s.sessionId));
+  const working = sessions.filter(
+    (s) => getEffectiveStatus(s) === "working" && !taskingIds.has(s.sessionId)
+  );
   const needsApproval = sessions.filter(
-    (s) => getEffectiveStatus(s) === "waiting" && s.hasPendingToolUse
+    (s) => getEffectiveStatus(s) === "waiting" && s.hasPendingToolUse && !taskingIds.has(s.sessionId)
   );
   const waiting = sessions.filter(
-    (s) => getEffectiveStatus(s) === "waiting" && !s.hasPendingToolUse
+    (s) => getEffectiveStatus(s) === "waiting" && !s.hasPendingToolUse && !taskingIds.has(s.sessionId)
   );
-  const review = sessions.filter((s) => getEffectiveStatus(s) === "review");
+  const review = sessions.filter(
+    (s) => getEffectiveStatus(s) === "review" && !taskingIds.has(s.sessionId)
+  );
   const idle = sessions.filter((s) => getEffectiveStatus(s) === "idle");
 
   const isHot = activityScore > 50;
@@ -81,6 +90,12 @@ export function RepoSection({ repoId, repoUrl, sessions, activityScore }: RepoSe
           status="working"
           sessions={working}
           color="green"
+        />
+        <KanbanColumn
+          title="Tasking"
+          status="working"
+          sessions={tasking}
+          color="iris"
         />
         <KanbanColumn
           title="Needs Approval"
