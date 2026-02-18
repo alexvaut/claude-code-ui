@@ -1,6 +1,6 @@
 import { watch, type FSWatcher } from "chokidar";
 import { EventEmitter } from "node:events";
-import { readFile, unlink, readdir } from "node:fs/promises";
+import { readFile, unlink, readdir, access, constants } from "node:fs/promises";
 import { join } from "node:path";
 import {
   tailJSONL,
@@ -53,6 +53,8 @@ export interface SessionState {
   gitRepoUrl: string | null;   // https://github.com/owner/repo
   gitRepoId: string | null;    // owner/repo
   gitRootPath: string | null;  // Absolute path to git repo root (for grouping)
+  isWorktree: boolean;         // Whether this session is in a git worktree
+  worktreePath: string | null; // The worktree checkout root directory
   // Set when branch changed since last update
   branchChanged?: boolean;
   // Pending permission from PermissionRequest hook
@@ -136,7 +138,7 @@ export class SessionWatcher extends EventEmitter {
     this.watcher
       .on("add", (path) => {
         if (!path.endsWith(".jsonl")) return;
-        log("Watcher", `New file detected: ${path.split("/").slice(-2).join("/")}`);
+        log("Watcher", `New file detected: ${path.replace(/\\/g, "/").split("/").slice(-2).join("/")}`);
         this.handleFile(path, "add");
       })
       .on("change", (path) => {
@@ -206,7 +208,7 @@ export class SessionWatcher extends EventEmitter {
    * Format: <session_id>.<type>.json (e.g., abc123.permission.json)
    */
   private parseSignalFilename(filepath: string): { sessionId: string; type: "working" | "permission" | "stop" | "ended" } | null {
-    const filename = filepath.split("/").pop() || "";
+    const filename = filepath.replace(/\\/g, "/").split("/").pop() || "";
     const match = filename.match(/^(.+)\.(working|permission|stop|ended)\.json$/);
     if (!match) return null;
     return { sessionId: match[1], type: match[2] as "working" | "permission" | "stop" | "ended" };
@@ -270,16 +272,17 @@ export class SessionWatcher extends EventEmitter {
         this.workingSignals.delete(sessionId);
         this.pendingPermissions.delete(sessionId);
 
-        // Update session to waiting
+        // Update session — worktree sessions go to "review" (no interactive user), others wait
         const session = this.sessions.get(sessionId);
         if (session) {
           const previousStatus = session.status;
           session.hasWorkingSignal = false;
           session.hasStopSignal = true;
           session.pendingPermission = undefined;
+          const stopStatus = session.isWorktree ? "review" : "waiting";
           session.status = {
             ...session.status,
-            status: "waiting",
+            status: stopStatus,
             hasPendingToolUse: false,
           };
           this.emit("session", { type: "updated", session, previousStatus } satisfies SessionEvent);
@@ -293,7 +296,7 @@ export class SessionWatcher extends EventEmitter {
         this.pendingPermissions.delete(sessionId);
         this.stopSignals.delete(sessionId);
 
-        // Update session to idle
+        // Update session — worktree sessions go to "review", others to "idle"
         const session = this.sessions.get(sessionId);
         if (session) {
           const previousStatus = session.status;
@@ -301,9 +304,10 @@ export class SessionWatcher extends EventEmitter {
           session.hasStopSignal = false;
           session.hasEndedSignal = true;
           session.pendingPermission = undefined;
+          const endedStatus = session.isWorktree ? "review" : "idle";
           session.status = {
             ...session.status,
-            status: "idle",
+            status: endedStatus,
             hasPendingToolUse: false,
           };
           this.emit("session", { type: "updated", session, previousStatus } satisfies SessionEvent);
@@ -414,30 +418,46 @@ export class SessionWatcher extends EventEmitter {
   }
 
   /**
-   * Periodically check for sessions that have gone stale.
-   * This catches cases where Claude finishes responding but no turn_duration
-   * event is written to the log file.
+   * Periodically check for sessions that have gone stale, and check
+   * worktree existence for "review" sessions.
    */
-  private checkStaleSessions(): void {
+  private async checkStaleSessions(): Promise<void> {
     for (const session of this.sessions.values()) {
-      // Only check sessions that are currently "working"
-      if (session.status.status !== "working") {
+      // Check working sessions for stale timeout
+      if (session.status.status === "working") {
+        // Re-derive status which will apply STALE_TIMEOUT
+        const newStatus = deriveStatus(session.entries);
+
+        // If status changed, emit update
+        if (statusChanged(session.status, newStatus)) {
+          const previousStatus = session.status;
+          session.status = newStatus;
+
+          this.emit("session", {
+            type: "updated",
+            session,
+            previousStatus,
+          } satisfies SessionEvent);
+        }
         continue;
       }
 
-      // Re-derive status which will apply STALE_TIMEOUT
-      const newStatus = deriveStatus(session.entries);
-
-      // If status changed, emit update
-      if (statusChanged(session.status, newStatus)) {
-        const previousStatus = session.status;
-        session.status = newStatus;
-
-        this.emit("session", {
-          type: "updated",
-          session,
-          previousStatus,
-        } satisfies SessionEvent);
+      // Check review sessions — transition to idle if worktree was deleted
+      if (session.status.status === "review" && session.worktreePath) {
+        try {
+          await access(session.worktreePath, constants.F_OK);
+          // Worktree still exists, keep in review
+        } catch {
+          // Worktree deleted — transition to idle
+          const previousStatus = session.status;
+          session.status = { ...session.status, status: "idle" };
+          log("Watcher", `Worktree deleted for ${session.sessionId.slice(0, 8)}, review → idle`);
+          this.emit("session", {
+            type: "updated",
+            session,
+            previousStatus,
+          } satisfies SessionEvent);
+        }
       }
     }
   }
@@ -504,6 +524,8 @@ export class SessionWatcher extends EventEmitter {
           branch: existingSession.gitBranch,
           rootPath: existingSession.gitRootPath,
           isGitRepo: existingSession.gitRepoUrl !== null || existingSession.gitBranch !== null,
+          isWorktree: existingSession.isWorktree,
+          worktreePath: existingSession.worktreePath,
         };
       } else {
         metadata = extractMetadata(allEntries);
@@ -566,14 +588,16 @@ export class SessionWatcher extends EventEmitter {
       const hasEndedSig = this.endedSignals.has(sessionId);
 
       if (hasEndedSig) {
-        // Session ended - idle
-        status = { ...status, status: "idle", hasPendingToolUse: false };
+        // Session ended — worktree sessions go to "review", others to "idle"
+        const endedStatus = gitInfo.isWorktree ? "review" : "idle";
+        status = { ...status, status: endedStatus, hasPendingToolUse: false };
       } else if (pendingPermission) {
         // Waiting for permission approval
         status = { ...status, status: "waiting", hasPendingToolUse: true };
       } else if (hasStopSig) {
-        // Claude's turn ended - waiting for user
-        status = { ...status, status: "waiting", hasPendingToolUse: false };
+        // Claude's turn ended — worktree sessions go to "review" (no interactive user), others wait
+        const stopStatus = gitInfo.isWorktree ? "review" : "waiting";
+        status = { ...status, status: stopStatus, hasPendingToolUse: false };
       } else if (hasWorkingSig) {
         // User started turn - working
         status = { ...status, status: "working", hasPendingToolUse: false };
@@ -595,6 +619,8 @@ export class SessionWatcher extends EventEmitter {
         gitRepoUrl: gitInfo.repoUrl,
         gitRepoId: gitInfo.repoId,
         gitRootPath: gitInfo.rootPath,
+        isWorktree: gitInfo.isWorktree,
+        worktreePath: gitInfo.worktreePath,
         branchChanged,
         pendingPermission,
         hasWorkingSignal: hasWorkingSig,

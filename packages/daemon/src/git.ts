@@ -1,5 +1,5 @@
-import { readFile, access, constants } from "node:fs/promises";
-import { join, dirname } from "node:path";
+import { readFile, lstat } from "node:fs/promises";
+import { join, dirname, resolve } from "node:path";
 
 export interface GitInfo {
   repoUrl: string | null;      // Full URL: https://github.com/owner/repo or git@github.com:owner/repo
@@ -7,23 +7,82 @@ export interface GitInfo {
   branch: string | null;       // Current branch name
   rootPath: string | null;     // Absolute path to the git repo root (directory containing .git)
   isGitRepo: boolean;
+  isWorktree: boolean;          // Whether this cwd is inside a git worktree
+  worktreePath: string | null;  // The worktree checkout root directory (if worktree)
 }
 
 /**
- * Find the .git directory for a given path, walking up the tree.
+ * Result of resolving a .git entry (file or directory).
  */
-async function findGitDir(startPath: string): Promise<string | null> {
+interface GitDirInfo {
+  /** Main .git/ directory — used for reading config (origin URL) */
+  mainGitDir: string;
+  /** Git dir for reading HEAD — worktree-specific, or same as mainGitDir */
+  headGitDir: string;
+  /** Whether this is a worktree */
+  isWorktree: boolean;
+  /** The worktree root directory (dirname of .git file) */
+  worktreeRoot: string | null;
+}
+
+/**
+ * Find the .git entry for a given path, walking up the tree.
+ * Handles both normal repos (.git directory) and worktrees (.git file).
+ */
+async function findGitDirInfo(startPath: string): Promise<GitDirInfo | null> {
   let currentPath = startPath;
-  const root = "/";
+  const root = dirname(currentPath) === currentPath ? currentPath : "/";
 
   while (currentPath !== root) {
     const gitPath = join(currentPath, ".git");
     try {
-      await access(gitPath, constants.F_OK);
-      return gitPath;
+      const stats = await lstat(gitPath);
+
+      if (stats.isDirectory()) {
+        // Normal repo — mainGitDir and headGitDir are the same
+        return {
+          mainGitDir: gitPath,
+          headGitDir: gitPath,
+          isWorktree: false,
+          worktreeRoot: null,
+        };
+      }
+
+      if (stats.isFile()) {
+        // Worktree — .git is a file containing "gitdir: <path>"
+        const content = (await readFile(gitPath, "utf-8")).trim();
+        const match = content.match(/^gitdir:\s*(.+)$/);
+        if (!match) {
+          // Malformed .git file, skip
+          currentPath = dirname(currentPath);
+          continue;
+        }
+
+        // Resolve the worktree git dir (may be relative)
+        const worktreeGitDir = resolve(currentPath, match[1].trim());
+
+        // Read commondir to find the main .git directory
+        let mainGitDir: string;
+        try {
+          const commondirContent = (await readFile(join(worktreeGitDir, "commondir"), "utf-8")).trim();
+          mainGitDir = resolve(worktreeGitDir, commondirContent);
+        } catch {
+          // No commondir — fall back to treating worktreeGitDir as main
+          mainGitDir = worktreeGitDir;
+        }
+
+        return {
+          mainGitDir,
+          headGitDir: worktreeGitDir,
+          isWorktree: true,
+          worktreeRoot: currentPath,
+        };
+      }
     } catch {
-      currentPath = dirname(currentPath);
+      // .git doesn't exist at this level, walk up
     }
+
+    currentPath = dirname(currentPath);
   }
 
   return null;
@@ -123,49 +182,65 @@ async function getOriginUrl(gitDir: string): Promise<string | null> {
   }
 }
 
+const NO_GIT: GitInfo = {
+  repoUrl: null, repoId: null, branch: null, rootPath: null,
+  isGitRepo: false, isWorktree: false, worktreePath: null,
+};
+
 /**
  * Get GitHub repo info for a directory.
  */
 export async function getGitInfo(cwd: string): Promise<GitInfo> {
-  const gitDir = await findGitDir(cwd);
+  const gitDirInfo = await findGitDirInfo(cwd);
 
-  if (!gitDir) {
-    return { repoUrl: null, repoId: null, branch: null, rootPath: null, isGitRepo: false };
+  if (!gitDirInfo) {
+    return NO_GIT;
   }
 
-  const rootPath = dirname(gitDir);
+  // Main repo root (for grouping) — dirname of the main .git directory
+  // Normalize drive letter to lowercase on Windows for consistent grouping
+  let rootPath = dirname(gitDirInfo.mainGitDir);
+  if (/^[A-Z]:/.test(rootPath)) {
+    rootPath = rootPath[0].toLowerCase() + rootPath.slice(1);
+  }
 
   const [originUrl, branch] = await Promise.all([
-    getOriginUrl(gitDir),
-    _getCurrentBranchInternal(gitDir),
+    getOriginUrl(gitDirInfo.mainGitDir),         // Config lives in main .git/
+    _getCurrentBranchInternal(gitDirInfo.headGitDir), // HEAD is per-worktree
   ]);
+
+  const base = {
+    branch,
+    rootPath,
+    isGitRepo: true,
+    isWorktree: gitDirInfo.isWorktree,
+    worktreePath: gitDirInfo.worktreeRoot,
+  };
 
   if (!originUrl) {
     // It's a git repo but has no origin remote
-    return { repoUrl: null, repoId: null, branch, rootPath, isGitRepo: true };
+    return { repoUrl: null, repoId: null, ...base };
   }
 
   const parsed = parseGitUrl(originUrl);
 
   if (!parsed) {
     // It's a git repo with an origin, but not GitHub
-    return { repoUrl: originUrl, repoId: null, branch, rootPath, isGitRepo: true };
+    return { repoUrl: originUrl, repoId: null, ...base };
   }
 
   return {
     repoUrl: parsed.repoUrl,
     repoId: parsed.repoId,
-    branch,
-    rootPath,
-    isGitRepo: true,
+    ...base,
   };
 }
 
 // Cache git info by cwd to avoid repeated filesystem lookups
-// Store both the info and the git directory path for branch refresh
+// Store the HEAD git dir (worktree-specific) for branch refresh
 interface CachedGitInfo {
   info: GitInfo;
-  gitDir: string | null;
+  headGitDir: string | null;
   lastChecked: number;
 }
 
@@ -183,8 +258,8 @@ export async function getGitInfoCached(cwd: string): Promise<GitInfo> {
   // If we have cached info and it's recent, just refresh the branch
   if (cached && now - cached.lastChecked < CACHE_TTL_MS) {
     // Quick branch refresh
-    if (cached.gitDir) {
-      const branch = await getCurrentBranchFromDir(cached.gitDir);
+    if (cached.headGitDir) {
+      const branch = await getCurrentBranchFromDir(cached.headGitDir);
       if (branch !== cached.info.branch) {
         cached.info = { ...cached.info, branch };
       }
@@ -193,12 +268,12 @@ export async function getGitInfoCached(cwd: string): Promise<GitInfo> {
   }
 
   // Full refresh
-  const gitDir = await findGitDir(cwd);
+  const gitDirInfo = await findGitDirInfo(cwd);
   const info = await getGitInfo(cwd);
 
   gitInfoCache.set(cwd, {
     info,
-    gitDir,
+    headGitDir: gitDirInfo?.headGitDir ?? null,
     lastChecked: now,
   });
 
@@ -211,14 +286,14 @@ export async function getGitInfoCached(cwd: string): Promise<GitInfo> {
  */
 export async function getCurrentBranch(cwd: string): Promise<string | null> {
   const cached = gitInfoCache.get(cwd);
-  if (cached?.gitDir) {
-    return getCurrentBranchFromDir(cached.gitDir);
+  if (cached?.headGitDir) {
+    return getCurrentBranchFromDir(cached.headGitDir);
   }
 
-  const gitDir = await findGitDir(cwd);
-  if (!gitDir) return null;
+  const gitDirInfo = await findGitDirInfo(cwd);
+  if (!gitDirInfo) return null;
 
-  return getCurrentBranchFromDir(gitDir);
+  return getCurrentBranchFromDir(gitDirInfo.headGitDir);
 }
 
 /**

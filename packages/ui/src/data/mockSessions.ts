@@ -19,6 +19,8 @@ export interface MockSession {
   gitRepoUrl: string | null;
   gitRepoId: string | null;
   gitRootPath: string | null;
+  isWorktree: boolean;
+  worktreePath: string | null;
 }
 
 const now = Date.now();
@@ -41,6 +43,8 @@ export const mockSessions: MockSession[] = [
     gitRepoUrl: "https://github.com/KyleAMathews/claude-code-ui",
     gitRepoId: "KyleAMathews/claude-code-ui",
     gitRootPath: "/Users/kyle/code/claude-code-ui",
+    isWorktree: false,
+    worktreePath: null,
   },
   {
     sessionId: "xyz789-abc123-456",
@@ -56,6 +60,8 @@ export const mockSessions: MockSession[] = [
     gitRepoUrl: "https://github.com/KyleAMathews/vite-plugin-capsize-radix-ui",
     gitRepoId: "KyleAMathews/vite-plugin-capsize-radix-ui",
     gitRootPath: "/Users/kyle/code/vite-plugin-capsize",
+    isWorktree: false,
+    worktreePath: null,
   },
 
   // Waiting - needs tool approval
@@ -73,6 +79,8 @@ export const mockSessions: MockSession[] = [
     gitRepoUrl: "https://github.com/anthropics/anthropic-sdk-typescript",
     gitRepoId: "anthropics/anthropic-sdk-typescript",
     gitRootPath: "/Users/kyle/code/anthropic-sdk",
+    isWorktree: false,
+    worktreePath: null,
   },
   {
     sessionId: "wait789-input-123",
@@ -88,6 +96,8 @@ export const mockSessions: MockSession[] = [
     gitRepoUrl: "https://github.com/KyleAMathews/claude-code-ui",
     gitRepoId: "KyleAMathews/claude-code-ui",
     gitRootPath: "/Users/kyle/code/claude-code-ui",
+    isWorktree: false,
+    worktreePath: null,
   },
 
   // Waiting - waiting for user input
@@ -105,6 +115,8 @@ export const mockSessions: MockSession[] = [
     gitRepoUrl: "https://github.com/anthropics/durable-streams",
     gitRepoId: "anthropics/durable-streams",
     gitRootPath: "/Users/kyle/code/durable-streams",
+    isWorktree: false,
+    worktreePath: null,
   },
 
   // Idle sessions
@@ -122,6 +134,8 @@ export const mockSessions: MockSession[] = [
     gitRepoUrl: "https://github.com/KyleAMathews/claude-code-ui",
     gitRepoId: "KyleAMathews/claude-code-ui",
     gitRootPath: "/Users/kyle/code/claude-code-ui",
+    isWorktree: false,
+    worktreePath: null,
   },
   {
     sessionId: "idle789-done-123",
@@ -137,6 +151,8 @@ export const mockSessions: MockSession[] = [
     gitRepoUrl: "https://github.com/KyleAMathews/blog",
     gitRepoId: "KyleAMathews/blog",
     gitRootPath: "/Users/kyle/code/blog",
+    isWorktree: false,
+    worktreePath: null,
   },
 
   // Non-GitHub sessions (Other group)
@@ -154,6 +170,8 @@ export const mockSessions: MockSession[] = [
     gitRepoUrl: null,
     gitRepoId: null,
     gitRootPath: null,
+    isWorktree: false,
+    worktreePath: null,
   },
   {
     sessionId: "other789-scripts-123",
@@ -169,6 +187,8 @@ export const mockSessions: MockSession[] = [
     gitRepoUrl: null,
     gitRepoId: null,
     gitRootPath: null,
+    isWorktree: false,
+    worktreePath: null,
   },
 ];
 
@@ -176,6 +196,7 @@ export const mockSessions: MockSession[] = [
 const STATUS_WEIGHTS: Record<SessionStatus, number> = {
   working: 100,  // Highest priority - actively processing
   waiting: 50,   // Needs attention
+  review: 25,    // Worktree task needs review
   idle: 1,       // Low priority
 };
 

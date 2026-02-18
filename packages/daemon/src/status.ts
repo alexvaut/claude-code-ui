@@ -47,12 +47,14 @@ export function formatStatus(result: StatusResult): string {
   const icons: Record<SessionStatus, string> = {
     working: "🟢",
     waiting: result.hasPendingToolUse ? "🟠" : "🟡",
+    review: "🔵",
     idle: "⚪",
   };
 
   const labels: Record<SessionStatus, string> = {
     working: "Working",
     waiting: result.hasPendingToolUse ? "Tool pending" : "Waiting for input",
+    review: "Review",
     idle: "Idle",
   };
 

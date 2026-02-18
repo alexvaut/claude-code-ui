@@ -11,6 +11,10 @@ const IDLE_TIMEOUT_MS = 60 * 60 * 1000; // 1 hour - match daemon setting
  * Sessions inactive for 1 hour are considered idle regardless of stored status.
  */
 function getEffectiveStatus(session: Session): SessionStatus {
+  // Review status is daemon-controlled (worktree existence check), don't override
+  if (session.status === "review") {
+    return "review";
+  }
   const elapsed = Date.now() - new Date(session.lastActivityAt).getTime();
   if (elapsed > IDLE_TIMEOUT_MS) {
     return "idle";
@@ -34,6 +38,7 @@ export function RepoSection({ repoId, repoUrl, sessions, activityScore }: RepoSe
   const waiting = sessions.filter(
     (s) => getEffectiveStatus(s) === "waiting" && !s.hasPendingToolUse
   );
+  const review = sessions.filter((s) => getEffectiveStatus(s) === "review");
   const idle = sessions.filter((s) => getEffectiveStatus(s) === "idle");
 
   const isHot = activityScore > 50;
@@ -70,7 +75,7 @@ export function RepoSection({ repoId, repoUrl, sessions, activityScore }: RepoSe
         </Text>
       </Flex>
 
-      <Flex gap="3" style={{ minHeight: 240 }}>
+      <Flex gap="3" style={{ minHeight: 240, overflow: "hidden" }}>
         <KanbanColumn
           title="Working"
           status="working"
@@ -88,6 +93,12 @@ export function RepoSection({ repoId, repoUrl, sessions, activityScore }: RepoSe
           status="waiting"
           sessions={waiting}
           color="yellow"
+        />
+        <KanbanColumn
+          title="Review"
+          status="review"
+          sessions={review}
+          color="cyan"
         />
         <KanbanColumn
           title="Idle"

@@ -1,1 +1,1 @@
-export type SessionStatus = "working" | "waiting" | "idle";
+export type SessionStatus = "working" | "waiting" | "idle" | "review";

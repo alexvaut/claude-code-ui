@@ -121,34 +121,21 @@ export function SessionCard({ session, disableHover }: SessionCardProps) {
     <HoverCard.Root openDelay={750} open={disableHover ? false : undefined}>
       <HoverCard.Trigger>
         <Card size="2" className={getCardClass(session)}>
-          <Flex direction="column" gap="4">
+          <Flex direction="column" gap="4" style={{ minWidth: 0 }}>
             {/* Header: directory and time */}
-            <Flex justify="between" align="center">
-              <Flex align="center" gap="1">
+            <Flex justify="between" align="center" style={{ minWidth: 0 }}>
+              <Box style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0, flex: 1 }}>
                 <Text size="1" color="gray" style={{ fontFamily: "var(--code-font-family)" }}>
                   {dirPath}
                 </Text>
-                <Tooltip content="Open in VS Code">
-                  <IconButton
-                    asChild
-                    size="1"
-                    variant="ghost"
-                    color="gray"
-                    onClick={(e: React.MouseEvent) => e.stopPropagation()}
-                  >
-                    <a href={toVSCodeUri(session.cwd)} aria-label="Open in VS Code">
-                      <VSCodeIcon size={12} />
-                    </a>
-                  </IconButton>
-                </Tooltip>
-              </Flex>
-              <Text size="1" color="gray">
+              </Box>
+              <Text size="1" color="gray" style={{ flexShrink: 0 }}>
                 {formatTimeAgo(session.lastActivityAt)}
               </Text>
             </Flex>
 
             {/* Main content: goal as primary text */}
-            <Heading size="3" weight="medium" highContrast>
+            <Heading size="3" weight="medium" highContrast style={{ overflowWrap: "anywhere", minWidth: 0 }}>
               {session.goal || session.originalPrompt.slice(0, 50)}
             </Heading>
 
@@ -163,14 +150,14 @@ export function SessionCard({ session, disableHover }: SessionCardProps) {
                 </Code>
               </Flex>
             ) : (
-              <Text size="1" color="gray">
+              <Text size="1" color="gray" style={{ overflowWrap: "anywhere", minWidth: 0 }}>
                 {session.summary}
               </Text>
             )}
 
             {/* Footer: branch/PR info, message count, and VS Code link */}
-            <Flex align="center" justify="between" gap="2">
-              <Flex align="center" gap="2">
+            <Flex align="center" gap="2" style={{ minWidth: 0 }}>
+              <Flex align="center" gap="2" style={{ minWidth: 0, overflow: "hidden", flex: 1 }}>
                 {session.pr ? (
                   <a
                     href={session.pr.url}
@@ -184,29 +171,56 @@ export function SessionCard({ session, disableHover }: SessionCardProps) {
                     </Badge>
                   </a>
                 ) : session.gitBranch ? (
-                  <Code size="1" variant="soft" color="gray">
-                    {session.gitBranch.length > 20
-                      ? session.gitBranch.slice(0, 17) + "..."
-                      : session.gitBranch}
+                  <Code size="1" variant="soft" color="gray" style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", display: "block" }}>
+                    {session.gitBranch}
                   </Code>
                 ) : null}
               </Flex>
-              <Flex align="center" gap="3">
+              <Flex align="center" gap="2" style={{ flexShrink: 0, marginLeft: "auto" }}>
                 <Text size="1" color="gray">
                   {session.messageCount} msgs
                 </Text>
-                <Tooltip content="Open in VS Code">
-                  <IconButton
-                    asChild
-                    size="1"
-                    variant="ghost"
-                    onClick={(e: React.MouseEvent) => e.stopPropagation()}
-                  >
-                    <a href={toVSCodeUri(session.cwd)} aria-label="Open in VS Code">
-                      <VSCodeIcon size={18} color={VSCODE_BLUE} />
-                    </a>
-                  </IconButton>
-                </Tooltip>
+                {session.isWorktree && session.gitRootPath ? (
+                  <Flex align="center" gap="1">
+                    <Tooltip content={`Open repo: ${session.gitRootPath}`}>
+                      <IconButton
+                        asChild
+                        size="1"
+                        variant="ghost"
+                        onClick={(e: React.MouseEvent) => e.stopPropagation()}
+                      >
+                        <a href={toVSCodeUri(session.gitRootPath)} aria-label="Open repo in VS Code">
+                          <VSCodeIcon size={18} color={VSCODE_BLUE} />
+                        </a>
+                      </IconButton>
+                    </Tooltip>
+                    <Tooltip content={`Open worktree: ${session.cwd}`}>
+                      <IconButton
+                        asChild
+                        size="1"
+                        variant="ghost"
+                        onClick={(e: React.MouseEvent) => e.stopPropagation()}
+                      >
+                        <a href={toVSCodeUri(session.cwd)} aria-label="Open worktree in VS Code">
+                          <VSCodeIcon size={18} color="var(--cyan-11)" />
+                        </a>
+                      </IconButton>
+                    </Tooltip>
+                  </Flex>
+                ) : (
+                  <Tooltip content="Open in VS Code">
+                    <IconButton
+                      asChild
+                      size="1"
+                      variant="ghost"
+                      onClick={(e: React.MouseEvent) => e.stopPropagation()}
+                    >
+                      <a href={toVSCodeUri(session.cwd)} aria-label="Open in VS Code">
+                        <VSCodeIcon size={18} color={VSCODE_BLUE} />
+                      </a>
+                    </IconButton>
+                  </Tooltip>
+                )}
               </Flex>
             </Flex>
           </Flex>
@@ -353,13 +367,32 @@ export function SessionCard({ session, disableHover }: SessionCardProps) {
               >
                 {session.cwd.replace(/^\/Users\/\w+\//, "~/")}
               </Link>
-              <Tooltip content="Open in VS Code">
-                <IconButton asChild size="1" variant="ghost" color="gray">
-                  <a href={toVSCodeUri(session.cwd)} aria-label="Open in VS Code">
-                    <VSCodeIcon size={12} />
-                  </a>
-                </IconButton>
-              </Tooltip>
+              {session.isWorktree && session.gitRootPath ? (
+                <>
+                  <Tooltip content={`Open repo: ${session.gitRootPath}`}>
+                    <IconButton asChild size="1" variant="ghost" color="gray">
+                      <a href={toVSCodeUri(session.gitRootPath)} aria-label="Open repo in VS Code">
+                        <VSCodeIcon size={12} />
+                      </a>
+                    </IconButton>
+                  </Tooltip>
+                  <Tooltip content={`Open worktree: ${session.cwd}`}>
+                    <IconButton asChild size="1" variant="ghost" color="gray">
+                      <a href={toVSCodeUri(session.cwd)} aria-label="Open worktree in VS Code">
+                        <VSCodeIcon size={12} color="var(--cyan-11)" />
+                      </a>
+                    </IconButton>
+                  </Tooltip>
+                </>
+              ) : (
+                <Tooltip content="Open in VS Code">
+                  <IconButton asChild size="1" variant="ghost" color="gray">
+                    <a href={toVSCodeUri(session.cwd)} aria-label="Open in VS Code">
+                      <VSCodeIcon size={12} />
+                    </a>
+                  </IconButton>
+                </Tooltip>
+              )}
             </Flex>
             <Text size="1" color="gray">
               {session.sessionId.slice(0, 8)}

@@ -7,13 +7,14 @@ interface KanbanColumnProps {
   title: string;
   status: SessionStatus | "needs-approval";
   sessions: Session[];
-  color: "green" | "orange" | "yellow" | "gray";
+  color: "green" | "orange" | "yellow" | "cyan" | "gray";
 }
 
 const headerClassMap = {
   green: "column-header-working",
   orange: "column-header-approval",
   yellow: "column-header-waiting",
+  cyan: "column-header-review",
   gray: "column-header-idle",
 };
 
@@ -53,6 +54,7 @@ export function KanbanColumn({ title, sessions, color }: KanbanColumnProps) {
     green: "var(--grass-3)",
     orange: "var(--orange-3)",
     yellow: "var(--amber-3)",
+    cyan: "var(--cyan-3)",
     gray: "var(--slate-3)",
   };
 
@@ -60,6 +62,7 @@ export function KanbanColumn({ title, sessions, color }: KanbanColumnProps) {
     green: "grass" as const,
     orange: "orange" as const,
     yellow: "amber" as const,
+    cyan: "cyan" as const,
     gray: "gray" as const,
   };
 
@@ -67,11 +70,12 @@ export function KanbanColumn({ title, sessions, color }: KanbanColumnProps) {
     <Box
       style={{
         flex: 1,
-        minWidth: 320,
+        minWidth: 0,
         maxWidth: 500,
+        overflow: "hidden",
         backgroundColor: colorMap[color],
         borderRadius: "var(--radius-4)",
-        border: `1px solid var(--${color === "gray" ? "slate" : color === "green" ? "grass" : color === "yellow" ? "amber" : "orange"}-6)`,
+        border: `1px solid var(--${{ green: "grass", orange: "orange", yellow: "amber", cyan: "cyan", gray: "slate" }[color]}-6)`,
       }}
       p="3"
     >
@@ -89,8 +93,8 @@ export function KanbanColumn({ title, sessions, color }: KanbanColumnProps) {
           </Text>
         </Flex>
 
-        <ScrollArea style={{ maxHeight: 420 }} ref={scrollAreaRef}>
-          <Flex direction="column" gap="2" pr="2">
+        <ScrollArea className="kanban-scroll" style={{ maxHeight: 420 }} scrollbars="vertical" ref={scrollAreaRef}>
+          <Flex direction="column" gap="2" pr="2" style={{ minWidth: 0, maxWidth: "100%" }}>
             {sessions.map((session) => (
               <SessionCard key={session.sessionId} session={session} disableHover={isScrolling} />
             ))}

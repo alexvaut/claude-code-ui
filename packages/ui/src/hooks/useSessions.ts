@@ -36,6 +36,7 @@ export function useSessions() {
 const STATUS_WEIGHTS: Record<Session["status"], number> = {
   working: 100,
   waiting: 50,
+  review: 25,
   idle: 1,
 };
 

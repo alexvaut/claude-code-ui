@@ -2,7 +2,7 @@ import { z } from "zod";
 import { createStateSchema } from "@durable-streams/state";
 
 // Session status enum
-export const SessionStatusSchema = z.enum(["working", "waiting", "idle"]);
+export const SessionStatusSchema = z.enum(["working", "waiting", "idle", "review"]);
 export type SessionStatus = z.infer<typeof SessionStatusSchema>;
 
 // Pending tool info
@@ -46,6 +46,8 @@ export const SessionSchema = z.object({
   gitRepoUrl: z.string().nullable(),
   gitRepoId: z.string().nullable(),
   gitRootPath: z.string().nullable(),
+  isWorktree: z.boolean(),
+  worktreePath: z.string().nullable(),
   originalPrompt: z.string(),
   status: SessionStatusSchema,
   lastActivityAt: z.string(), // ISO timestamp
