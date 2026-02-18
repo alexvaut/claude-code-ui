@@ -36,18 +36,19 @@ export function RepoSection({ repoId, repoUrl, sessions, activityScore }: RepoSe
 
   const isHot = activityScore > 50;
 
+  // Display the directory basename as the group name (handle both / and \ separators)
+  const displayName = repoId.split(/[/\\]/).pop() || repoId;
+
   return (
     <Box mb="7">
       <Flex align="center" gap="3" mb="4">
         <Heading size="6" weight="bold">
-          {repoId === "Other" ? (
-            <Text color="gray">Other</Text>
-          ) : repoUrl ? (
+          {repoUrl ? (
             <Link href={repoUrl} target="_blank" color="violet" highContrast>
-              {repoId}
+              {displayName}
             </Link>
           ) : (
-            repoId
+            displayName
           )}
         </Heading>
         {isHot && (

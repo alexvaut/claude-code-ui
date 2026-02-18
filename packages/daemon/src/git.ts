@@ -5,6 +5,7 @@ export interface GitInfo {
   repoUrl: string | null;      // Full URL: https://github.com/owner/repo or git@github.com:owner/repo
   repoId: string | null;       // Normalized: owner/repo
   branch: string | null;       // Current branch name
+  rootPath: string | null;     // Absolute path to the git repo root (directory containing .git)
   isGitRepo: boolean;
 }
 
@@ -129,8 +130,10 @@ export async function getGitInfo(cwd: string): Promise<GitInfo> {
   const gitDir = await findGitDir(cwd);
 
   if (!gitDir) {
-    return { repoUrl: null, repoId: null, branch: null, isGitRepo: false };
+    return { repoUrl: null, repoId: null, branch: null, rootPath: null, isGitRepo: false };
   }
+
+  const rootPath = dirname(gitDir);
 
   const [originUrl, branch] = await Promise.all([
     getOriginUrl(gitDir),
@@ -139,20 +142,21 @@ export async function getGitInfo(cwd: string): Promise<GitInfo> {
 
   if (!originUrl) {
     // It's a git repo but has no origin remote
-    return { repoUrl: null, repoId: null, branch, isGitRepo: true };
+    return { repoUrl: null, repoId: null, branch, rootPath, isGitRepo: true };
   }
 
   const parsed = parseGitUrl(originUrl);
 
   if (!parsed) {
     // It's a git repo with an origin, but not GitHub
-    return { repoUrl: originUrl, repoId: null, branch, isGitRepo: true };
+    return { repoUrl: originUrl, repoId: null, branch, rootPath, isGitRepo: true };
   }
 
   return {
     repoUrl: parsed.repoUrl,
     repoId: parsed.repoId,
     branch,
+    rootPath,
     isGitRepo: true,
   };
 }

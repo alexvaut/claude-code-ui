@@ -18,6 +18,7 @@ export interface MockSession {
   summary: string; // AI-generated summary of current state
   gitRepoUrl: string | null;
   gitRepoId: string | null;
+  gitRootPath: string | null;
 }
 
 const now = Date.now();
@@ -39,6 +40,7 @@ export const mockSessions: MockSession[] = [
     summary: "Writing SessionCard component",
     gitRepoUrl: "https://github.com/KyleAMathews/claude-code-ui",
     gitRepoId: "KyleAMathews/claude-code-ui",
+    gitRootPath: "/Users/kyle/code/claude-code-ui",
   },
   {
     sessionId: "xyz789-abc123-456",
@@ -53,6 +55,7 @@ export const mockSessions: MockSession[] = [
     summary: "Reading Radix theme tokens",
     gitRepoUrl: "https://github.com/KyleAMathews/vite-plugin-capsize-radix-ui",
     gitRepoId: "KyleAMathews/vite-plugin-capsize-radix-ui",
+    gitRootPath: "/Users/kyle/code/vite-plugin-capsize",
   },
 
   // Waiting - needs tool approval
@@ -69,6 +72,7 @@ export const mockSessions: MockSession[] = [
     summary: "Fixing chunk boundary handling",
     gitRepoUrl: "https://github.com/anthropics/anthropic-sdk-typescript",
     gitRepoId: "anthropics/anthropic-sdk-typescript",
+    gitRootPath: "/Users/kyle/code/anthropic-sdk",
   },
   {
     sessionId: "wait789-input-123",
@@ -83,6 +87,7 @@ export const mockSessions: MockSession[] = [
     summary: "Adding drag-drop library",
     gitRepoUrl: "https://github.com/KyleAMathews/claude-code-ui",
     gitRepoId: "KyleAMathews/claude-code-ui",
+    gitRootPath: "/Users/kyle/code/claude-code-ui",
   },
 
   // Waiting - waiting for user input
@@ -99,6 +104,7 @@ export const mockSessions: MockSession[] = [
     summary: "Asked: REST or WebSocket API?",
     gitRepoUrl: "https://github.com/anthropics/durable-streams",
     gitRepoId: "anthropics/durable-streams",
+    gitRootPath: "/Users/kyle/code/durable-streams",
   },
 
   // Idle sessions
@@ -115,6 +121,7 @@ export const mockSessions: MockSession[] = [
     summary: "Compared Zustand vs Jotai, recommended Zustand",
     gitRepoUrl: "https://github.com/KyleAMathews/claude-code-ui",
     gitRepoId: "KyleAMathews/claude-code-ui",
+    gitRootPath: "/Users/kyle/code/claude-code-ui",
   },
   {
     sessionId: "idle789-done-123",
@@ -129,6 +136,7 @@ export const mockSessions: MockSession[] = [
     summary: "Draft complete, ready for review",
     gitRepoUrl: "https://github.com/KyleAMathews/blog",
     gitRepoId: "KyleAMathews/blog",
+    gitRootPath: "/Users/kyle/code/blog",
   },
 
   // Non-GitHub sessions (Other group)
@@ -145,6 +153,7 @@ export const mockSessions: MockSession[] = [
     summary: "Asked: By date or by project?",
     gitRepoUrl: null,
     gitRepoId: null,
+    gitRootPath: null,
   },
   {
     sessionId: "other789-scripts-123",
@@ -159,6 +168,7 @@ export const mockSessions: MockSession[] = [
     summary: "Created cleanup.sh with 30-day retention",
     gitRepoUrl: null,
     gitRepoId: null,
+    gitRootPath: null,
   },
 ];
 
@@ -194,31 +204,30 @@ function calculateRepoActivityScore(sessions: MockSession[]): number {
   }, 0);
 }
 
-// Group sessions by repo, sorted by activity score
+// Group sessions by git root path (or cwd for non-git), sorted by activity score
 export function groupSessionsByRepo(sessions: MockSession[]) {
   const groups = new Map<string, MockSession[]>();
 
   for (const session of sessions) {
-    const key = session.gitRepoId ?? "Other";
+    const key = session.gitRootPath ?? session.cwd;
     const existing = groups.get(key) ?? [];
     existing.push(session);
     groups.set(key, existing);
   }
 
   // Build groups with activity scores
-  const groupsWithScores = Array.from(groups.entries()).map(([key, sessions]) => ({
-    repoId: key,
-    repoUrl: key === "Other" ? null : `https://github.com/${key}`,
-    sessions,
-    activityScore: calculateRepoActivityScore(sessions),
-  }));
-
-  // Sort by activity score (highest first), "Other" always last
-  groupsWithScores.sort((a, b) => {
-    if (a.repoId === "Other") return 1;
-    if (b.repoId === "Other") return -1;
-    return b.activityScore - a.activityScore;
+  const groupsWithScores = Array.from(groups.entries()).map(([key, sessions]) => {
+    const repoUrl = sessions.find((s) => s.gitRepoUrl)?.gitRepoUrl ?? null;
+    return {
+      repoId: key,
+      repoUrl,
+      sessions,
+      activityScore: calculateRepoActivityScore(sessions),
+    };
   });
+
+  // Sort by activity score (highest first)
+  groupsWithScores.sort((a, b) => b.activityScore - a.activityScore);
 
   return groupsWithScores;
 }

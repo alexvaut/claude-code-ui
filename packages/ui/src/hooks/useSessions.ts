@@ -62,31 +62,37 @@ function calculateRepoActivityScore(sessions: Session[]): number {
 }
 
 export interface RepoGroup {
+  /** Grouping key: git root path or cwd */
   repoId: string;
+  /** GitHub URL if available, for linking */
   repoUrl: string | null;
   sessions: Session[];
   activityScore: number;
 }
 
 /**
- * Group sessions by repo, sorted by activity score
+ * Group sessions by git root path (or cwd for non-git), sorted by activity score
  */
 export function groupSessionsByRepo(sessions: Session[]): RepoGroup[] {
   const groups = new Map<string, Session[]>();
 
   for (const session of sessions) {
-    const key = session.gitRepoId ?? "Other";
+    const key = session.gitRootPath ?? session.cwd;
     const existing = groups.get(key) ?? [];
     existing.push(session);
     groups.set(key, existing);
   }
 
-  const groupsWithScores = Array.from(groups.entries()).map(([key, sessions]) => ({
-    repoId: key,
-    repoUrl: key === "Other" ? null : `https://github.com/${key}`,
-    sessions,
-    activityScore: calculateRepoActivityScore(sessions),
-  }));
+  const groupsWithScores = Array.from(groups.entries()).map(([key, sessions]) => {
+    // Use the first session's gitRepoUrl for the group link (all sessions in the group share the same repo)
+    const repoUrl = sessions.find((s) => s.gitRepoUrl)?.gitRepoUrl ?? null;
+    return {
+      repoId: key,
+      repoUrl,
+      sessions,
+      activityScore: calculateRepoActivityScore(sessions),
+    };
+  });
 
   groupsWithScores.sort((a, b) => b.activityScore - a.activityScore);
 

@@ -45,6 +45,7 @@ export const SessionSchema = z.object({
   gitBranch: z.string().nullable(),
   gitRepoUrl: z.string().nullable(),
   gitRepoId: z.string().nullable(),
+  gitRootPath: z.string().nullable(),
   originalPrompt: z.string(),
   status: SessionStatusSchema,
   lastActivityAt: z.string(), // ISO timestamp

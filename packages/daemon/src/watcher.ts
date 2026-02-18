@@ -49,9 +49,10 @@ export interface SessionState {
   status: StatusResult;
   entries: LogEntry[];
   bytePosition: number;
-  // GitHub repo info
+  // Git repo info
   gitRepoUrl: string | null;   // https://github.com/owner/repo
-  gitRepoId: string | null;    // owner/repo (for grouping)
+  gitRepoId: string | null;    // owner/repo
+  gitRootPath: string | null;  // Absolute path to git repo root (for grouping)
   // Set when branch changed since last update
   branchChanged?: boolean;
   // Pending permission from PermissionRequest hook
@@ -501,6 +502,7 @@ export class SessionWatcher extends EventEmitter {
           repoUrl: existingSession.gitRepoUrl,
           repoId: existingSession.gitRepoId,
           branch: existingSession.gitBranch,
+          rootPath: existingSession.gitRootPath,
           isGitRepo: existingSession.gitRepoUrl !== null || existingSession.gitBranch !== null,
         };
       } else {
@@ -592,6 +594,7 @@ export class SessionWatcher extends EventEmitter {
         bytePosition: newPosition,
         gitRepoUrl: gitInfo.repoUrl,
         gitRepoId: gitInfo.repoId,
+        gitRootPath: gitInfo.rootPath,
         branchChanged,
         pendingPermission,
         hasWorkingSignal: hasWorkingSig,
