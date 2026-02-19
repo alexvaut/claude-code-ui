@@ -7,6 +7,7 @@
  *
  * States:
  *   working         — Claude is actively processing
+ *   tasking         — Claude is delegating to subagents (immune to stale timeout)
  *   needs_approval  — Tool use awaiting user approval
  *   waiting         — Claude finished, waiting for user input
  *   review          — Worktree session paused (turn ended or session closed)
@@ -14,12 +15,13 @@
  *
  * Transition table:
  *
- *              WORKING        STOP(wt)   STOP(!wt)  ENDED(wt)  ENDED(!wt)  PERM_REQ        WORKTREE_DEL
- *   working       ·           review     waiting    review     idle        needs_approval   ·
- *   needs_appr  working       review     waiting    review     idle        needs_approval   ·
- *   waiting     working         ·          ·          ·          ·         needs_approval   ·
- *   review      working         ·          ·          ·          ·            ·             idle
- *   idle        working         ·          ·          ·          ·            ·              ·
+ *              WORKING  STOP(wt)  STOP(!wt)  ENDED(wt)  ENDED(!wt)  PERM_REQ        TASK_STARTED  TASKS_DONE  WORKTREE_DEL
+ *   working      ·      review    waiting    review     idle        needs_approval   tasking          ·           ·
+ *   tasking      ·      review    waiting    review     idle        needs_approval      ·          working        ·
+ *   needs_appr working  review    waiting    review     idle        needs_approval      ·             ·           ·
+ *   waiting    working    ·          ·          ·          ·         needs_approval      ·             ·           ·
+ *   review     working    ·          ·          ·          ·            ·                ·             ·          idle
+ *   idle       working    ·          ·          ·          ·            ·                ·             ·           ·
  *
  *   · = no transition (stay in current state)
  */
@@ -32,6 +34,7 @@ import type { LogEntry, AssistantEntry, UserEntry, SystemEntry } from "./types.j
 
 export type SessionMachineState =
   | "working"
+  | "tasking"
   | "needs_approval"
   | "waiting"
   | "review"
@@ -42,7 +45,9 @@ export type SessionEvent =
   | { type: "STOP" }
   | { type: "ENDED" }
   | { type: "PERMISSION_REQUEST" }
-  | { type: "WORKTREE_DELETED" };
+  | { type: "WORKTREE_DELETED" }
+  | { type: "TASK_STARTED" }
+  | { type: "TASKS_DONE" };
 
 // ---------------------------------------------------------------------------
 // Pure transition function
@@ -59,6 +64,16 @@ export function transition(
         case "STOP": return isWorktree ? "review" : "waiting";
         case "ENDED": return isWorktree ? "review" : "idle";
         case "PERMISSION_REQUEST": return "needs_approval";
+        case "TASK_STARTED": return "tasking";
+        default: return state;
+      }
+
+    case "tasking":
+      switch (event.type) {
+        case "STOP": return isWorktree ? "review" : "waiting";
+        case "ENDED": return isWorktree ? "review" : "idle";
+        case "PERMISSION_REQUEST": return "needs_approval";
+        case "TASKS_DONE": return "working";
         default: return state;
       }
 
@@ -98,11 +113,12 @@ export function transition(
 // ---------------------------------------------------------------------------
 
 export function machineStateToPublishedStatus(state: SessionMachineState): {
-  status: "working" | "waiting" | "review" | "idle";
+  status: "working" | "tasking" | "waiting" | "review" | "idle";
   hasPendingToolUse: boolean;
 } {
   switch (state) {
     case "working": return { status: "working", hasPendingToolUse: false };
+    case "tasking": return { status: "tasking", hasPendingToolUse: false };
     case "needs_approval": return { status: "waiting", hasPendingToolUse: true };
     case "waiting": return { status: "waiting", hasPendingToolUse: false };
     case "review": return { status: "review", hasPendingToolUse: false };
@@ -221,7 +237,9 @@ export function replayEntries(
     }
   }
 
-  // Apply stale timeout for sessions with old activity
+  // Apply stale timeout for sessions with old activity.
+  // Note: "tasking" is deliberately excluded — subagents run independently,
+  // so the primary session being silent is expected.
   if (lastActivityAt) {
     const elapsed = Date.now() - new Date(lastActivityAt).getTime();
     if (elapsed > STALE_TIMEOUT_MS) {

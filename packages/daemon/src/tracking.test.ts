@@ -502,6 +502,41 @@ describe("Session Tracking", () => {
     it("idle + ENDED → idle (no-op)", () => {
       expect(transition("idle", { type: "ENDED" }, false)).toBe("idle");
     });
+
+    // Tasking state transitions
+    it("working + TASK_STARTED → tasking", () => {
+      expect(transition("working", { type: "TASK_STARTED" }, false)).toBe("tasking");
+    });
+    it("tasking + TASKS_DONE → working", () => {
+      expect(transition("tasking", { type: "TASKS_DONE" }, false)).toBe("working");
+    });
+    it("tasking + STOP → waiting (non-worktree)", () => {
+      expect(transition("tasking", { type: "STOP" }, false)).toBe("waiting");
+    });
+    it("tasking + STOP → review (worktree)", () => {
+      expect(transition("tasking", { type: "STOP" }, true)).toBe("review");
+    });
+    it("tasking + ENDED → idle (non-worktree)", () => {
+      expect(transition("tasking", { type: "ENDED" }, false)).toBe("idle");
+    });
+    it("tasking + ENDED → review (worktree)", () => {
+      expect(transition("tasking", { type: "ENDED" }, true)).toBe("review");
+    });
+    it("tasking + PERMISSION_REQUEST → needs_approval", () => {
+      expect(transition("tasking", { type: "PERMISSION_REQUEST" }, false)).toBe("needs_approval");
+    });
+    it("tasking + WORKING → tasking (no-op)", () => {
+      expect(transition("tasking", { type: "WORKING" }, false)).toBe("tasking");
+    });
+    it("tasking + TASK_STARTED → tasking (no-op)", () => {
+      expect(transition("tasking", { type: "TASK_STARTED" }, false)).toBe("tasking");
+    });
+    it("working + TASKS_DONE → working (no-op)", () => {
+      expect(transition("working", { type: "TASKS_DONE" }, false)).toBe("working");
+    });
+    it("needs_approval + TASK_STARTED → needs_approval (no-op)", () => {
+      expect(transition("needs_approval", { type: "TASK_STARTED" }, false)).toBe("needs_approval");
+    });
   });
 
   describe("JSONL Event Mapping", () => {
@@ -876,6 +911,68 @@ describe("Session Tracking", () => {
       expect(final.status).toBe("waiting");
       expect(final.hasPendingToolUse).toBe(false);
     });
+
+    it("task signal lifecycle: working → tasking → working", async () => {
+      const watcher = new SessionWatcher({ debounceMs: 50, permissionDelayMs: 1000 });
+      const statuses: string[] = [];
+      watcher.on("session", (event) => {
+        if (event.session.sessionId === TEST_SESSION_ID) {
+          statuses.push(event.session.status.status);
+        }
+      });
+
+      await watcher.start();
+
+      // 1. Create session → working
+      await writeFile(TEST_LOG_FILE, createUserEntry("do some tasks"));
+      await new Promise((r) => setTimeout(r, 1000));
+      expect(statuses).toContain("working");
+
+      // 2. Task signal → tasking
+      const taskFile1 = signalFile("task.toolu_001", {});
+      await writeFile(taskFile1, JSON.stringify({
+        session_id: TEST_SESSION_ID,
+        tool_use_id: "toolu_001",
+        agent_type: "Bash",
+        description: "Run tests",
+        started_at: new Date().toISOString(),
+      }));
+      await new Promise((r) => setTimeout(r, 500));
+      expect(statuses).toContain("tasking");
+
+      // 3. Second task signal → still tasking
+      const taskFile2 = signalFile("task.toolu_002", {});
+      await writeFile(taskFile2, JSON.stringify({
+        session_id: TEST_SESSION_ID,
+        tool_use_id: "toolu_002",
+        agent_type: "Explore",
+        description: "Search codebase",
+        started_at: new Date().toISOString(),
+      }));
+      await new Promise((r) => setTimeout(r, 500));
+
+      // 4. Remove first task → still tasking (one remains)
+      await rm(taskFile1, { force: true });
+      await new Promise((r) => setTimeout(r, 500));
+      expect(statuses[statuses.length - 1]).toBe("tasking");
+
+      // 5. Remove last task → working
+      await rm(taskFile2, { force: true });
+      await new Promise((r) => setTimeout(r, 500));
+      expect(statuses[statuses.length - 1]).toBe("working");
+
+      // 6. Stop signal → waiting
+      await writeFile(signalFile("stop", {}), JSON.stringify({
+        session_id: TEST_SESSION_ID,
+        stopped_at: new Date().toISOString(),
+      }));
+      await new Promise((r) => setTimeout(r, 500));
+
+      watcher.stop();
+      await new Promise((r) => setTimeout(r, 100));
+
+      expect(statuses[statuses.length - 1]).toBe("waiting");
+    });
   });
 
   describe("Claude -p E2E", () => {
@@ -951,6 +1048,90 @@ describe("Session Tracking", () => {
       const approvalEvents = events.filter(e => e.hasPendingToolUse);
       expect(approvalEvents).toHaveLength(0);
     }, 90000); // Extended timeout for real claude call
+
+    it("should track tasking state when claude spawns subagents", async () => {
+      const watcher = new SessionWatcher({ debounceMs: 50, permissionDelayMs: 1000 });
+
+      const newSessionIds = new Set<string>();
+      const events: Array<{
+        type: string;
+        sessionId: string;
+        status: string;
+        activeTasks: number;
+      }> = [];
+      watcher.on("session", (event) => {
+        if (event.type === "created") {
+          newSessionIds.add(event.session.sessionId);
+        }
+        if (newSessionIds.has(event.session.sessionId)) {
+          events.push({
+            type: event.type,
+            sessionId: event.session.sessionId,
+            status: event.session.status.status,
+            activeTasks: event.session.activeTasks.length,
+          });
+        }
+      });
+
+      await watcher.start();
+
+      // Wait for initial scan to complete so existing sessions are not counted
+      await new Promise((r) => setTimeout(r, 3000));
+      newSessionIds.clear();
+      events.length = 0;
+
+      // Find claude CLI
+      let claudePath = "claude";
+      const candidatePaths = [
+        path.join(os.homedir(), ".local", "bin", "claude.exe"),
+        path.join(os.homedir(), ".local", "bin", "claude"),
+      ];
+      for (const candidate of candidatePaths) {
+        try {
+          const { statSync } = await import("node:fs");
+          if (statSync(candidate).isFile()) { claudePath = candidate; break; }
+        } catch { /* not found */ }
+      }
+
+      // Run claude -p with a prompt that triggers Task tool (subagent spawning)
+      try {
+        const env = { ...process.env };
+        delete env.CLAUDECODE;
+        execFileSync(claudePath, [
+          "-p",
+          "Use the Task tool to spawn a single agent (subagent_type: 'haiku') that answers: what is 2+2? Reply with the answer only.",
+        ], {
+          timeout: 120000,
+          stdio: "pipe",
+          env,
+        });
+      } catch (err) {
+        watcher.stop();
+        await new Promise((r) => setTimeout(r, 100));
+        console.log("Skipping tasking claude -p test: claude CLI not available", (err as Error).message);
+        return;
+      }
+
+      // Wait for all signals to be processed
+      await new Promise((r) => setTimeout(r, 3000));
+
+      watcher.stop();
+      await new Promise((r) => setTimeout(r, 100));
+
+      // Should have detected the new claude session
+      expect(newSessionIds.size).toBeGreaterThan(0);
+      expect(events.length).toBeGreaterThan(0);
+
+      // At some point during the session, status should have been "tasking"
+      // Note: Claude may not always use the Task tool depending on the prompt,
+      // so we check if any tasking events occurred and verify them if present
+      const taskingEvents = events.filter(e => e.status === "tasking");
+      if (taskingEvents.length === 0) {
+        console.log("Claude did not use Task tool in this run — tasking state not observed. Re-run to retry.");
+      } else {
+        expect(taskingEvents[0].activeTasks).toBeGreaterThan(0);
+      }
+    }, 180000); // Extended timeout for subagent spawning
   });
 
   // ---------------------------------------------------------------------------

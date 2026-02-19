@@ -49,6 +49,7 @@ export function statusChanged(
 export function formatStatus(result: StatusResult): string {
   const icons: Record<SessionStatus, string> = {
     working: "🟢",
+    tasking: "🔵",
     waiting: result.hasPendingToolUse ? "🟠" : "🟡",
     review: "🔵",
     idle: "⚪",
@@ -56,6 +57,7 @@ export function formatStatus(result: StatusResult): string {
 
   const labels: Record<SessionStatus, string> = {
     working: "Working",
+    tasking: "Tasking",
     waiting: result.hasPendingToolUse ? "Tool pending" : "Waiting for input",
     review: "Review",
     idle: "Idle",

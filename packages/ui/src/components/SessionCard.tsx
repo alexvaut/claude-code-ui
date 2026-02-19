@@ -52,7 +52,7 @@ function DownloadIcon({ size = 16 }: { size?: number }) {
 
 function getCardClass(session: Session): string {
   const classes = ["session-card"];
-  if (session.status === "working") {
+  if (session.status === "working" || session.status === "tasking") {
     classes.push("status-working");
   }
   if (session.status === "waiting" && session.hasPendingToolUse) {
@@ -375,7 +375,7 @@ export function SessionCard({ session, disableHover }: SessionCardProps) {
                 No recent output
               </Text>
             )}
-            {session.status === "working" && (
+            {(session.status === "working" || session.status === "tasking") && (
               <Text color="grass" size="1">█</Text>
             )}
           </Flex>

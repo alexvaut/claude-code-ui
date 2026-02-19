@@ -35,6 +35,7 @@ export function useSessions() {
 // Activity score weights
 const STATUS_WEIGHTS: Record<Session["status"], number> = {
   working: 100,
+  tasking: 100,
   waiting: 50,
   review: 25,
   idle: 1,

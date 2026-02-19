@@ -2,7 +2,7 @@ import { z } from "zod";
 import { createStateSchema } from "@durable-streams/state";
 
 // Session status enum
-export const SessionStatusSchema = z.enum(["working", "waiting", "idle", "review"]);
+export const SessionStatusSchema = z.enum(["working", "tasking", "waiting", "idle", "review"]);
 export type SessionStatus = z.infer<typeof SessionStatusSchema>;
 
 // Pending tool info

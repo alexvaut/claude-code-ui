@@ -195,6 +195,7 @@ export const mockSessions: MockSession[] = [
 // Activity score weights
 const STATUS_WEIGHTS: Record<SessionStatus, number> = {
   working: 100,  // Highest priority - actively processing
+  tasking: 100,  // Delegating to subagents - equally active
   waiting: 50,   // Needs attention
   review: 25,    // Worktree task needs review
   idle: 1,       // Low priority

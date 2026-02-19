@@ -132,7 +132,7 @@ export class SessionWatcher extends EventEmitter {
     if (nextState === prevState) return false;
 
     // On-exit side effects
-    if (prevState === "working" || prevState === "needs_approval") {
+    if (prevState === "working" || prevState === "tasking" || prevState === "needs_approval") {
       // Cancel permission debounce timer (any pending debounce is stale)
       const timer = this.permissionTimers.get(sessionId);
       if (timer) { clearTimeout(timer); this.permissionTimers.delete(sessionId); }
@@ -143,7 +143,7 @@ export class SessionWatcher extends EventEmitter {
     }
 
     // On-enter side effects
-    if (nextState === "working" && (prevState === "review" || prevState === "waiting" || prevState === "idle")) {
+    if ((nextState === "working" || nextState === "tasking") && (prevState === "review" || prevState === "waiting" || prevState === "idle")) {
       this.cleanupSignalFile(sessionId, "stop");
       this.cleanupSignalFile(sessionId, "ended");
     }
@@ -155,6 +155,12 @@ export class SessionWatcher extends EventEmitter {
     const published = machineStateToPublishedStatus(nextState);
     session.status = { ...session.status, status: published.status, hasPendingToolUse: published.hasPendingToolUse };
     this.emit("session", { type: "updated", session, previousStatus } satisfies SessionEvent);
+
+    // Auto-escalate: if we landed on "working" but have active tasks, transition to "tasking"
+    if (nextState === "working" && session.activeTasks.length > 0) {
+      this.transitionSession(sessionId, { type: "TASK_STARTED" }, { event: "TASK_STARTED", source: "hook", signal: "auto-escalate" });
+    }
+
     return true;
   }
 
@@ -333,11 +339,15 @@ export class SessionWatcher extends EventEmitter {
         };
         sessionTasks.set(parsed.toolUseId, activeTask);
 
-        // Update session
+        // Update session and transition to tasking
         const session = this.sessions.get(sessionId);
         if (session) {
           session.activeTasks = this.getActiveTasksForSession(sessionId);
-          this.emit("session", { type: "updated", session } satisfies SessionEvent);
+          // Fire TASK_STARTED to transition working → tasking
+          // If already tasking (second task added), transition is a no-op but we still emit for data update
+          if (!this.transitionSession(sessionId, { type: "TASK_STARTED" }, { event: "TASK_STARTED", source: "hook", signal: `task.${parsed.toolUseId}.json` })) {
+            this.emit("session", { type: "updated", session } satisfies SessionEvent);
+          }
         }
       } else if (type === "compacting") {
         const compactSignal = data as CompactingSignal;
@@ -410,6 +420,11 @@ export class SessionWatcher extends EventEmitter {
           const published = machineStateToPublishedStatus(nextState);
           session.status = { ...session.status, status: published.status, hasPendingToolUse: published.hasPendingToolUse };
           this.emit("session", { type: "updated", session, previousStatus } satisfies SessionEvent);
+
+          // Auto-escalate to tasking if active tasks exist after permission resolved
+          if (nextState === "working" && session.activeTasks.length > 0) {
+            this.transitionSession(sessionId, { type: "TASK_STARTED" }, { event: "TASK_STARTED", source: "permission-removed", signal: "auto-escalate" });
+          }
         }
       }
     } else if (type === "task" && parsed.toolUseId) {
@@ -423,14 +438,28 @@ export class SessionWatcher extends EventEmitter {
       const session = this.sessions.get(sessionId);
       if (session) {
         session.activeTasks = this.getActiveTasksForSession(sessionId);
-        this.emit("session", { type: "updated", session } satisfies SessionEvent);
+        // Fire TASKS_DONE when all tasks are complete → transitions tasking → working
+        if (session.activeTasks.length === 0) {
+          if (!this.transitionSession(sessionId, { type: "TASKS_DONE" }, { event: "TASKS_DONE", source: "hook", signal: `task.${parsed.toolUseId}.json removed` })) {
+            this.emit("session", { type: "updated", session } satisfies SessionEvent);
+          }
+        } else {
+          this.emit("session", { type: "updated", session } satisfies SessionEvent);
+        }
       }
     } else if (type === "compacting") {
       this.compactingSignals.delete(sessionId);
       const session = this.sessions.get(sessionId);
       if (session) {
         session.activeTasks = this.getActiveTasksForSession(sessionId);
-        this.emit("session", { type: "updated", session } satisfies SessionEvent);
+        // Fire TASKS_DONE if no tasks remain after compacting ends
+        if (session.activeTasks.length === 0) {
+          if (!this.transitionSession(sessionId, { type: "TASKS_DONE" }, { event: "TASKS_DONE", source: "hook" })) {
+            this.emit("session", { type: "updated", session } satisfies SessionEvent);
+          }
+        } else {
+          this.emit("session", { type: "updated", session } satisfies SessionEvent);
+        }
       }
     }
   }
@@ -475,7 +504,9 @@ export class SessionWatcher extends EventEmitter {
    */
   private async checkStaleSessions(): Promise<void> {
     for (const session of this.sessions.values()) {
-      // Stale timeout: working sessions without hook signals get STOP after 15s inactivity
+      // Stale timeout: working sessions without hook signals get STOP after 15s inactivity.
+      // Note: "tasking" is deliberately excluded — subagents run independently,
+      // so the primary session being silent is expected.
       if (session.machineState === "working" && !session.isHookDriven) {
         const elapsed = Date.now() - new Date(session.status.lastActivityAt).getTime();
         if (elapsed > 15_000) {
@@ -708,12 +739,12 @@ export class SessionWatcher extends EventEmitter {
         isHookDriven: existingSession?.isHookDriven ?? false,
         pendingPermission: existingSession?.pendingPermission,
         // Hook signals are authoritative for active tasks.
-        // JSONL fallback only reports tasks when session is working — if the turn
+        // JSONL fallback only reports tasks when session is working/tasking — if the turn
         // ended (waiting/idle), all tasks completed even if tool_result matching
         // failed (e.g., due to context compaction rewriting entries).
         activeTasks: this.taskSignals.has(sessionId) || this.compactingSignals.has(sessionId)
           ? this.getActiveTasksForSession(sessionId)
-          : status.status === "working" ? sessionInfo.activeTasks : [],
+          : (status.status === "working" || status.status === "tasking") ? sessionInfo.activeTasks : [],
         todoProgress: sessionInfo.todoProgress,
       };
 
@@ -729,6 +760,13 @@ export class SessionWatcher extends EventEmitter {
         existingSession.todoProgress?.completed !== session.todoProgress?.completed ||
         existingSession.todoProgress?.total !== session.todoProgress?.total
       );
+
+      // Reconcile tasking state with active tasks (handles both new and existing sessions)
+      if (session.machineState === "working" && session.activeTasks.length > 0) {
+        this.transitionSession(sessionId, { type: "TASK_STARTED" }, { event: "TASK_STARTED", source: session.isHookDriven ? "hook" : "jsonl", signal: "reconcile" });
+      } else if (session.machineState === "tasking" && session.activeTasks.length === 0) {
+        this.transitionSession(sessionId, { type: "TASKS_DONE" }, { event: "TASKS_DONE", source: session.isHookDriven ? "hook" : "jsonl", signal: "reconcile" });
+      }
 
       if (isNew) {
         appendTransition(sessionId, null, session.machineState, { event: "INIT", source: "replay", entryCount: allEntries.length });

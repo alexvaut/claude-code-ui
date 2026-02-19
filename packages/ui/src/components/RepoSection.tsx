@@ -11,9 +11,9 @@ const IDLE_TIMEOUT_MS = 60 * 60 * 1000; // 1 hour - match daemon setting
  * Sessions inactive for 1 hour are considered idle regardless of stored status.
  */
 function getEffectiveStatus(session: Session): SessionStatus {
-  // Review status is daemon-controlled (worktree existence check), don't override
-  if (session.status === "review") {
-    return "review";
+  // Review and tasking statuses are daemon-controlled, don't override
+  if (session.status === "review" || session.status === "tasking") {
+    return session.status;
   }
   const elapsed = Date.now() - new Date(session.lastActivityAt).getTime();
   if (elapsed > IDLE_TIMEOUT_MS) {
@@ -31,23 +31,15 @@ interface RepoSectionProps {
 
 export function RepoSection({ repoId, repoUrl, sessions, activityScore }: RepoSectionProps) {
   // Use effective status to categorize sessions (accounts for time-based idle)
-  // Sessions with active tasks get pulled into "Tasking" column regardless of status
-  const tasking = sessions.filter(
-    (s) => s.activeTasks.length > 0 && getEffectiveStatus(s) !== "idle"
-  );
-  const taskingIds = new Set(tasking.map((s) => s.sessionId));
-  const working = sessions.filter(
-    (s) => getEffectiveStatus(s) === "working" && !taskingIds.has(s.sessionId)
-  );
+  const working = sessions.filter((s) => getEffectiveStatus(s) === "working");
+  const tasking = sessions.filter((s) => getEffectiveStatus(s) === "tasking");
   const needsApproval = sessions.filter(
-    (s) => getEffectiveStatus(s) === "waiting" && s.hasPendingToolUse && !taskingIds.has(s.sessionId)
+    (s) => getEffectiveStatus(s) === "waiting" && s.hasPendingToolUse
   );
   const waiting = sessions.filter(
-    (s) => getEffectiveStatus(s) === "waiting" && !s.hasPendingToolUse && !taskingIds.has(s.sessionId)
+    (s) => getEffectiveStatus(s) === "waiting" && !s.hasPendingToolUse
   );
-  const review = sessions.filter(
-    (s) => getEffectiveStatus(s) === "review" && !taskingIds.has(s.sessionId)
-  );
+  const review = sessions.filter((s) => getEffectiveStatus(s) === "review");
   const idle = sessions.filter((s) => getEffectiveStatus(s) === "idle");
 
   const isHot = activityScore > 50;
@@ -93,7 +85,7 @@ export function RepoSection({ repoId, repoUrl, sessions, activityScore }: RepoSe
         />
         <KanbanColumn
           title="Tasking"
-          status="working"
+          status="tasking"
           sessions={tasking}
           color="iris"
         />

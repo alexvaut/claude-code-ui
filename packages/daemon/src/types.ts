@@ -156,7 +156,7 @@ export interface SessionMetadata {
 }
 
 // Session status
-export type SessionStatus = "working" | "waiting" | "idle" | "review";
+export type SessionStatus = "working" | "tasking" | "waiting" | "idle" | "review";
 
 export interface StatusResult {
   status: SessionStatus;
