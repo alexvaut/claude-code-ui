@@ -30,6 +30,26 @@ const toolIcons: Record<string, string> = {
   MultiEdit: "✏️",
 };
 
+function DownloadIcon({ size = 16 }: { size?: number }) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      style={{ display: "block" }}
+    >
+      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+      <polyline points="7 10 12 15 17 10" />
+      <line x1="12" y1="15" x2="12" y2="3" />
+    </svg>
+  );
+}
+
 function getCardClass(session: Session): string {
   const classes = ["session-card"];
   if (session.status === "working") {
@@ -199,6 +219,22 @@ export function SessionCard({ session, disableHover }: SessionCardProps) {
                     {session.todoProgress.completed}/{session.todoProgress.total} tasks
                   </Text>
                 )}
+                <Tooltip content="Download transition log">
+                  <IconButton
+                    asChild
+                    size="1"
+                    variant="ghost"
+                    onClick={(e: React.MouseEvent) => e.stopPropagation()}
+                  >
+                    <a
+                      href={`/logs/${session.sessionId}`}
+                      download={`${session.sessionId}.log`}
+                      aria-label="Download transition log"
+                    >
+                      <DownloadIcon size={16} />
+                    </a>
+                  </IconButton>
+                </Tooltip>
                 {session.isWorktree && session.gitRootPath ? (
                   <Flex align="center" gap="1">
                     <Tooltip content={`Open repo: ${session.gitRootPath}`}>

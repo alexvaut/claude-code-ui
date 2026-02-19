@@ -20,6 +20,7 @@ import {
 import { getGitInfoCached, type GitInfo } from "./git.js";
 import type { LogEntry, SessionMetadata, StatusResult } from "./types.js";
 import { log } from "./log.js";
+import { appendTransition, type TransitionMeta } from "./transition-log.js";
 
 const CLAUDE_PROJECTS_DIR = `${process.env.HOME}/.claude/projects`;
 const SIGNALS_DIR = `${process.env.HOME}/.claude/session-signals`;
@@ -122,7 +123,7 @@ export class SessionWatcher extends EventEmitter {
    * Handles on-exit/on-enter side effects and emits update if state changed.
    * Returns true if state actually changed.
    */
-  private transitionSession(sessionId: string, event: MachineEvent): boolean {
+  private transitionSession(sessionId: string, event: MachineEvent, meta: TransitionMeta): boolean {
     const session = this.sessions.get(sessionId);
     if (!session) return false;
 
@@ -149,6 +150,7 @@ export class SessionWatcher extends EventEmitter {
 
     // Update state
     session.machineState = nextState;
+    appendTransition(sessionId, prevState, nextState, meta);
     const previousStatus = session.status;
     const published = machineStateToPublishedStatus(nextState);
     session.status = { ...session.status, status: published.status, hasPendingToolUse: published.hasPendingToolUse };
@@ -282,7 +284,7 @@ export class SessionWatcher extends EventEmitter {
         log("Watcher", `Working signal for session ${sessionId}`);
         const session = this.sessions.get(sessionId);
         if (session) session.isHookDriven = true;
-        this.transitionSession(sessionId, { type: "WORKING" });
+        this.transitionSession(sessionId, { type: "WORKING" }, { event: "WORKING", source: "hook", signal: "working.json" });
       } else if (type === "permission") {
         const permission = data as PendingPermission;
         log("Watcher", `Pending permission for session ${sessionId}: ${permission.tool_name}`);
@@ -301,18 +303,18 @@ export class SessionWatcher extends EventEmitter {
           this.permissionTimers.delete(sessionId);
           const s = this.sessions.get(sessionId);
           if (s) s.pendingPermission = permission;
-          this.transitionSession(sessionId, { type: "PERMISSION_REQUEST" });
+          this.transitionSession(sessionId, { type: "PERMISSION_REQUEST" }, { event: "PERMISSION_REQUEST", source: "hook", signal: "permission.json", tool: permission.tool_name });
         }, this.permissionDelayMs));
       } else if (type === "stop") {
         log("Watcher", `Stop signal for session ${sessionId}`);
         const session = this.sessions.get(sessionId);
         if (session) session.isHookDriven = true;
-        this.transitionSession(sessionId, { type: "STOP" });
+        this.transitionSession(sessionId, { type: "STOP" }, { event: "STOP", source: "hook", signal: "stop.json" });
       } else if (type === "ended") {
         log("Watcher", `Session ended signal for ${sessionId}`);
         const session = this.sessions.get(sessionId);
         if (session) session.isHookDriven = true;
-        this.transitionSession(sessionId, { type: "ENDED" });
+        this.transitionSession(sessionId, { type: "ENDED" }, { event: "ENDED", source: "hook", signal: "ended.json" });
       } else if (type === "task" && parsed.toolUseId) {
         const taskSignal = data as TaskSignal;
         log("Watcher", `Task signal for session ${sessionId}: ${taskSignal.agent_type || "unknown"} - ${taskSignal.description || ""}`);
@@ -402,6 +404,7 @@ export class SessionWatcher extends EventEmitter {
         const { state } = replayEntries(session.entries, session.isWorktree);
         const nextState = state;
         if (nextState !== session.machineState) {
+          appendTransition(sessionId, session.machineState, nextState, { event: "REPLAY", source: "permission-removed" });
           session.machineState = nextState;
           const previousStatus = session.status;
           const published = machineStateToPublishedStatus(nextState);
@@ -476,7 +479,7 @@ export class SessionWatcher extends EventEmitter {
       if (session.machineState === "working" && !session.isHookDriven) {
         const elapsed = Date.now() - new Date(session.status.lastActivityAt).getTime();
         if (elapsed > 15_000) {
-          this.transitionSession(session.sessionId, { type: "STOP" });
+          this.transitionSession(session.sessionId, { type: "STOP" }, { event: "STOP", source: "stale-check", elapsed });
         }
       }
 
@@ -486,7 +489,7 @@ export class SessionWatcher extends EventEmitter {
           await access(session.worktreePath, constants.F_OK);
         } catch {
           log("Watcher", `Worktree deleted for ${session.sessionId.slice(0, 8)}, review → idle`);
-          this.transitionSession(session.sessionId, { type: "WORKTREE_DELETED" });
+          this.transitionSession(session.sessionId, { type: "WORKTREE_DELETED" }, { event: "WORKTREE_DELETED", source: "stale-check" });
         }
       }
     }
@@ -665,7 +668,14 @@ export class SessionWatcher extends EventEmitter {
         for (const entry of newEntries) {
           const event = logEntryToSessionEvent(entry);
           if (event) {
+            const prevState = currentState;
             currentState = transition(currentState, event, gitInfo.isWorktree);
+            if (currentState !== prevState) {
+              const entryType = entry.type === "system"
+                ? `system/${(entry as { subtype?: string }).subtype ?? "unknown"}`
+                : entry.type;
+              appendTransition(sessionId, prevState, currentState, { event: event.type, source: "jsonl", entryType });
+            }
           }
         }
         if (currentState !== existingSession.machineState) {
@@ -721,6 +731,7 @@ export class SessionWatcher extends EventEmitter {
       );
 
       if (isNew) {
+        appendTransition(sessionId, null, session.machineState, { event: "INIT", source: "replay", entryCount: allEntries.length });
         this.emit("session", {
           type: "created",
           session,

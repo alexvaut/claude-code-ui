@@ -10,6 +10,11 @@ import jetBrainsMono from "@capsizecss/metrics/jetBrainsMono"
 import arial from "@capsizecss/metrics/arial"
 
 export default defineConfig({
+  server: {
+    proxy: {
+      "/logs": "http://127.0.0.1:4451",
+    },
+  },
   plugins: [
     TanStackRouterVite({
       routesDirectory: "./src/routes",

@@ -25,6 +25,7 @@ for (const envPath of envPaths) {
 import { SessionWatcher, type SessionEvent, type SessionState } from "./watcher.js";
 import { StreamServer } from "./server.js";
 import { formatStatus } from "./status.js";
+import { startLogServer, stopLogServer } from "./log-server.js";
 
 const PORT = parseInt(process.env.PORT ?? "4450", 10);
 const MAX_AGE_HOURS = parseInt(process.env.MAX_AGE_HOURS ?? "24", 10);
@@ -58,6 +59,9 @@ async function main(): Promise<void> {
   // Start the durable streams server
   const streamServer = new StreamServer({ port: PORT });
   await streamServer.start();
+
+  // Start the transition log HTTP server
+  await startLogServer();
 
   console.log(`Stream URL: ${colors.cyan}${streamServer.getStreamUrl()}${colors.reset}`);
   console.log();
@@ -104,6 +108,7 @@ async function main(): Promise<void> {
     console.log();
     console.log(`${colors.dim}Shutting down...${colors.reset}`);
     watcher.stop();
+    await stopLogServer();
     await streamServer.stop();
     process.exit(0);
   });
