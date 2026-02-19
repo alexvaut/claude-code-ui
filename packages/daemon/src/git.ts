@@ -1,4 +1,4 @@
-import { readFile, lstat } from "node:fs/promises";
+import { readFile, writeFile, lstat } from "node:fs/promises";
 import { join, dirname, resolve } from "node:path";
 
 export interface GitInfo {
@@ -31,9 +31,8 @@ interface GitDirInfo {
  */
 async function findGitDirInfo(startPath: string): Promise<GitDirInfo | null> {
   let currentPath = startPath;
-  const root = dirname(currentPath) === currentPath ? currentPath : "/";
 
-  while (currentPath !== root) {
+  while (true) {
     const gitPath = join(currentPath, ".git");
     try {
       const stats = await lstat(gitPath);
@@ -82,7 +81,9 @@ async function findGitDirInfo(startPath: string): Promise<GitDirInfo | null> {
       // .git doesn't exist at this level, walk up
     }
 
-    currentPath = dirname(currentPath);
+    const parent = dirname(currentPath);
+    if (parent === currentPath) break; // Reached filesystem root
+    currentPath = parent;
   }
 
   return null;
@@ -187,6 +188,76 @@ const NO_GIT: GitInfo = {
   isGitRepo: false, isWorktree: false, worktreePath: null,
 };
 
+// ---------------------------------------------------------------------------
+// Persistent git info cache — survives daemon restarts so deleted worktrees
+// still resolve to their main repo for grouping.
+// ---------------------------------------------------------------------------
+
+interface PersistedGitEntry {
+  rootPath: string;
+  repoUrl: string | null;
+  repoId: string | null;
+  isWorktree: boolean;
+  worktreePath: string | null;
+}
+
+const PERSISTENT_CACHE_PATH = join(
+  process.env.HOME ?? process.env.USERPROFILE ?? ".",
+  ".claude",
+  "git-info-cache.json",
+);
+
+let persistentCache: Map<string, PersistedGitEntry> | null = null;
+
+async function loadPersistentCache(): Promise<Map<string, PersistedGitEntry>> {
+  if (persistentCache) return persistentCache;
+  try {
+    const raw = await readFile(PERSISTENT_CACHE_PATH, "utf-8");
+    const obj = JSON.parse(raw) as Record<string, PersistedGitEntry>;
+    persistentCache = new Map(Object.entries(obj));
+  } catch {
+    persistentCache = new Map();
+  }
+  return persistentCache;
+}
+
+function savePersistentCache(): void {
+  if (!persistentCache) return;
+  const obj: Record<string, PersistedGitEntry> = {};
+  for (const [k, v] of persistentCache) obj[k] = v;
+  // Fire-and-forget — don't block on I/O
+  writeFile(PERSISTENT_CACHE_PATH, JSON.stringify(obj, null, 2), "utf-8").catch(() => {});
+}
+
+function persistGitInfo(cwd: string, info: GitInfo): void {
+  if (!info.isGitRepo || !info.rootPath) return;
+  const cache = persistentCache ?? new Map();
+  persistentCache = cache;
+  cache.set(cwd, {
+    rootPath: info.rootPath,
+    repoUrl: info.repoUrl,
+    repoId: info.repoId,
+    isWorktree: info.isWorktree,
+    worktreePath: info.worktreePath,
+  });
+  savePersistentCache();
+}
+
+function lookupPersistentCache(cwd: string): GitInfo | null {
+  if (!persistentCache) return null;
+  const entry = persistentCache.get(cwd);
+  if (!entry) return null;
+  return {
+    repoUrl: entry.repoUrl,
+    repoId: entry.repoId,
+    branch: null, // Can't read HEAD from deleted worktree
+    rootPath: entry.rootPath,
+    isGitRepo: true,
+    isWorktree: entry.isWorktree,
+    worktreePath: entry.worktreePath,
+  };
+}
+
 /**
  * Get GitHub repo info for a directory.
  */
@@ -250,8 +321,12 @@ const CACHE_TTL_MS = 60 * 1000; // 1 minute
 /**
  * Get GitHub repo info with caching.
  * Repo URL and ID are cached longer, but branch is refreshed more frequently.
+ * Falls back to a persistent on-disk cache for deleted worktrees.
  */
 export async function getGitInfoCached(cwd: string): Promise<GitInfo> {
+  // Ensure persistent cache is loaded
+  await loadPersistentCache();
+
   const cached = gitInfoCache.get(cwd);
   const now = Date.now();
 
@@ -270,6 +345,24 @@ export async function getGitInfoCached(cwd: string): Promise<GitInfo> {
   // Full refresh
   const gitDirInfo = await findGitDirInfo(cwd);
   const info = await getGitInfo(cwd);
+
+  // If filesystem resolution succeeded, persist for future use
+  if (info.isGitRepo) {
+    persistGitInfo(cwd, info);
+  }
+
+  // If filesystem resolution failed, check persistent cache (deleted worktree)
+  if (!info.isGitRepo) {
+    const persisted = lookupPersistentCache(cwd);
+    if (persisted) {
+      gitInfoCache.set(cwd, {
+        info: persisted,
+        headGitDir: null,
+        lastChecked: now,
+      });
+      return persisted;
+    }
+  }
 
   gitInfoCache.set(cwd, {
     info,
@@ -323,4 +416,10 @@ async function getCurrentBranchFromDir(gitDir: string): Promise<string | null> {
  */
 export function clearGitCache(cwd: string): void {
   gitInfoCache.delete(cwd);
+}
+
+/** @internal — for tests only. Resets all in-memory and persistent cache state. */
+export function _resetGitCaches(): void {
+  gitInfoCache.clear();
+  persistentCache = null;
 }

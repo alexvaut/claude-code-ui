@@ -9,6 +9,20 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# On Windows (MSYS2/Git Bash), convert /c/... paths to C:/... so they work
+# when Claude Code invokes hooks with a non-MSYS bash.
+if [[ "$OSTYPE" == msys* || "$OSTYPE" == cygwin* || "$OSTYPE" == mingw* ]]; then
+  if command -v cygpath &> /dev/null; then
+    SCRIPT_DIR="$(cygpath -m "$SCRIPT_DIR")"
+  else
+    # Fallback: /c/foo → C:/foo  (pure bash, no GNU sed needed)
+    if [[ "$SCRIPT_DIR" =~ ^/([a-zA-Z])/ ]]; then
+      SCRIPT_DIR="${BASH_REMATCH[1]^}:${SCRIPT_DIR:2}"
+    fi
+  fi
+fi
+
 SETTINGS_FILE="$HOME/.claude/settings.json"
 SIGNALS_DIR="$HOME/.claude/session-signals"
 

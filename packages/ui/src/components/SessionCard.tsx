@@ -114,8 +114,8 @@ function getCIStatusColor(status: CIStatus): "green" | "red" | "yellow" | "gray"
 
 export function SessionCard({ session, disableHover }: SessionCardProps) {
   const showPendingTool = session.hasPendingToolUse && session.pendingTool;
-  // Show path from ~ (e.g., ~/programs/project)
-  const dirPath = session.cwd.replace(/^\/Users\/[^/]+/, "~");
+  // Show path from ~ (e.g., ~/programs/project) — handles both Unix and Windows paths
+  const dirPath = session.cwd.replace(/^(?:[A-Za-z]:[\\/])?Users[\\/][^\\/]+/, "~");
 
   return (
     <HoverCard.Root openDelay={750} open={disableHover ? false : undefined}>
@@ -384,7 +384,7 @@ export function SessionCard({ session, disableHover }: SessionCardProps) {
                 highContrast
                 style={{ fontFamily: "var(--code-font-family)" }}
               >
-                {session.cwd.replace(/^\/Users\/\w+\//, "~/")}
+                {session.cwd.replace(/^(?:[A-Za-z]:[\\/])?Users[\\/][^\\/]+[\\/]/, "~/")}
               </Link>
               {session.isWorktree && session.gitRootPath ? (
                 <>

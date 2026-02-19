@@ -8,7 +8,15 @@ import {
   extractSessionId,
   extractEncodedDir,
 } from "./parser.js";
-import { deriveStatus, statusChanged } from "./status.js";
+import { statusChanged } from "./status.js";
+import {
+  transition,
+  logEntryToSessionEvent,
+  machineStateToPublishedStatus,
+  replayEntries,
+  type SessionMachineState,
+  type SessionEvent as MachineEvent,
+} from "./status-machine.js";
 import { getGitInfoCached, type GitInfo } from "./git.js";
 import type { LogEntry, SessionMetadata, StatusResult } from "./types.js";
 import { log } from "./log.js";
@@ -21,21 +29,6 @@ export interface PendingPermission {
   tool_name: string;
   tool_input?: Record<string, unknown>;
   pending_since: string;
-}
-
-export interface StopSignal {
-  session_id: string;
-  stopped_at: string;
-}
-
-export interface SessionEndSignal {
-  session_id: string;
-  ended_at: string;
-}
-
-export interface WorkingSignal {
-  session_id: string;
-  working_since: string;
 }
 
 export interface TaskSignal {
@@ -80,16 +73,13 @@ export interface SessionState {
   gitRootPath: string | null;  // Absolute path to git repo root (for grouping)
   isWorktree: boolean;         // Whether this session is in a git worktree
   worktreePath: string | null; // The worktree checkout root directory
+  // State machine
+  machineState: SessionMachineState;
+  isHookDriven: boolean;       // True once first hook signal arrives (skip stale timeout)
   // Set when branch changed since last update
   branchChanged?: boolean;
-  // Pending permission from PermissionRequest hook
+  // Pending permission data (set when debounce fires, cleared on exit from needs_approval)
   pendingPermission?: PendingPermission;
-  // True when UserPromptSubmit hook has fired (user started turn)
-  hasWorkingSignal?: boolean;
-  // True when Stop hook has fired (Claude's turn definitively ended)
-  hasStopSignal?: boolean;
-  // True when SessionEnd hook has fired (session closed)
-  hasEndedSignal?: boolean;
   // Active subagents spawned via Task tool
   activeTasks: ActiveTask[];
   // Todo progress from TodoWrite
@@ -106,10 +96,6 @@ export class SessionWatcher extends EventEmitter {
   private watcher: FSWatcher | null = null;
   private signalWatcher: FSWatcher | null = null;
   private sessions = new Map<string, SessionState>();
-  private pendingPermissions = new Map<string, PendingPermission>();
-  private workingSignals = new Map<string, WorkingSignal>();
-  private stopSignals = new Map<string, StopSignal>();
-  private endedSignals = new Map<string, SessionEndSignal>();
   private taskSignals = new Map<string, Map<string, ActiveTask>>(); // sessionId → toolUseId → ActiveTask
   private compactingSignals = new Map<string, string>(); // sessionId → startedAt
   private debounceTimers = new Map<string, NodeJS.Timeout>();
@@ -125,38 +111,56 @@ export class SessionWatcher extends EventEmitter {
   }
 
   /**
-   * Check if a session has a pending permission request.
-   */
-  hasPendingPermission(sessionId: string): boolean {
-    return this.pendingPermissions.has(sessionId);
-  }
-
-  /**
    * Get pending permission for a session.
    */
   getPendingPermission(sessionId: string): PendingPermission | undefined {
-    return this.pendingPermissions.get(sessionId);
+    return this.sessions.get(sessionId)?.pendingPermission;
   }
 
   /**
-   * Check if a session has a working signal (turn in progress).
+   * Transition a session's machine state via an event.
+   * Handles on-exit/on-enter side effects and emits update if state changed.
+   * Returns true if state actually changed.
    */
-  hasWorkingSignal(sessionId: string): boolean {
-    return this.workingSignals.has(sessionId);
+  private transitionSession(sessionId: string, event: MachineEvent): boolean {
+    const session = this.sessions.get(sessionId);
+    if (!session) return false;
+
+    const prevState = session.machineState;
+    const nextState = transition(prevState, event, session.isWorktree);
+    if (nextState === prevState) return false;
+
+    // On-exit side effects
+    if (prevState === "working" || prevState === "needs_approval") {
+      // Cancel permission debounce timer (any pending debounce is stale)
+      const timer = this.permissionTimers.get(sessionId);
+      if (timer) { clearTimeout(timer); this.permissionTimers.delete(sessionId); }
+    }
+    if (prevState === "needs_approval" && nextState !== "needs_approval") {
+      session.pendingPermission = undefined;
+      this.cleanupSignalFile(sessionId, "permission");
+    }
+
+    // On-enter side effects
+    if (nextState === "working" && (prevState === "review" || prevState === "waiting" || prevState === "idle")) {
+      this.cleanupSignalFile(sessionId, "stop");
+      this.cleanupSignalFile(sessionId, "ended");
+    }
+
+    // Update state
+    session.machineState = nextState;
+    const previousStatus = session.status;
+    const published = machineStateToPublishedStatus(nextState);
+    session.status = { ...session.status, status: published.status, hasPendingToolUse: published.hasPendingToolUse };
+    this.emit("session", { type: "updated", session, previousStatus } satisfies SessionEvent);
+    return true;
   }
 
   /**
-   * Check if a session has received a stop signal (turn ended).
+   * Best-effort cleanup of a signal file.
    */
-  hasStopSignal(sessionId: string): boolean {
-    return this.stopSignals.has(sessionId);
-  }
-
-  /**
-   * Check if a session has received an ended signal (session closed).
-   */
-  hasEndedSignal(sessionId: string): boolean {
-    return this.endedSignals.has(sessionId);
+  private cleanupSignalFile(sessionId: string, type: string): void {
+    unlink(join(SIGNALS_DIR, `${sessionId}.${type}.json`)).catch(() => {});
   }
 
   async start(): Promise<void> {
@@ -275,100 +279,40 @@ export class SessionWatcher extends EventEmitter {
       const data = JSON.parse(content);
 
       if (type === "working") {
-        const workingSignal = data as WorkingSignal;
         log("Watcher", `Working signal for session ${sessionId}`);
-        this.workingSignals.set(sessionId, workingSignal);
-        // Clear stop signal since new turn is starting
-        this.stopSignals.delete(sessionId);
-
-        // Update session to working
         const session = this.sessions.get(sessionId);
-        if (session) {
-          const previousStatus = session.status;
-          session.hasWorkingSignal = true;
-          session.hasStopSignal = false;
-          session.status = {
-            ...session.status,
-            status: "working",
-            hasPendingToolUse: false,
-          };
-          this.emit("session", { type: "updated", session, previousStatus } satisfies SessionEvent);
-        }
+        if (session) session.isHookDriven = true;
+        this.transitionSession(sessionId, { type: "WORKING" });
       } else if (type === "permission") {
         const permission = data as PendingPermission;
         log("Watcher", `Pending permission for session ${sessionId}: ${permission.tool_name}`);
-        this.pendingPermissions.set(sessionId, permission);
+
+        const session = this.sessions.get(sessionId);
+        if (session) session.isHookDriven = true;
 
         // Cancel any existing debounce timer
         const existingTimer = this.permissionTimers.get(sessionId);
         if (existingTimer) clearTimeout(existingTimer);
 
-        // Debounce: only show "Needs Approval" if permission is still pending after delay.
-        // Auto-approved tools (e.g. EnterPlanMode) resolve quickly and never trigger the update.
+        // Debounce: only send PERMISSION_REQUEST after delay.
+        // Auto-approved tools resolve quickly — their permission file gets deleted
+        // before the timer fires, so the timer callback becomes a no-op.
         this.permissionTimers.set(sessionId, setTimeout(() => {
           this.permissionTimers.delete(sessionId);
-          if (!this.pendingPermissions.has(sessionId)) return;
-
-          const session = this.sessions.get(sessionId);
-          if (session) {
-            const previousStatus = session.status;
-            session.pendingPermission = permission;
-            session.status = {
-              ...session.status,
-              status: "waiting",
-              hasPendingToolUse: true,
-            };
-            this.emit("session", { type: "updated", session, previousStatus } satisfies SessionEvent);
-          }
+          const s = this.sessions.get(sessionId);
+          if (s) s.pendingPermission = permission;
+          this.transitionSession(sessionId, { type: "PERMISSION_REQUEST" });
         }, this.permissionDelayMs));
       } else if (type === "stop") {
-        const stopSignal = data as StopSignal;
         log("Watcher", `Stop signal for session ${sessionId}`);
-        this.stopSignals.set(sessionId, stopSignal);
-        // Clear working and permission signals since turn ended
-        this.workingSignals.delete(sessionId);
-        this.pendingPermissions.delete(sessionId);
-
-        // Update session — worktree sessions go to "review" (no interactive user), others wait
         const session = this.sessions.get(sessionId);
-        if (session) {
-          const previousStatus = session.status;
-          session.hasWorkingSignal = false;
-          session.hasStopSignal = true;
-          session.pendingPermission = undefined;
-          const stopStatus = session.isWorktree ? "review" : "waiting";
-          session.status = {
-            ...session.status,
-            status: stopStatus,
-            hasPendingToolUse: false,
-          };
-          this.emit("session", { type: "updated", session, previousStatus } satisfies SessionEvent);
-        }
+        if (session) session.isHookDriven = true;
+        this.transitionSession(sessionId, { type: "STOP" });
       } else if (type === "ended") {
-        const endSignal = data as SessionEndSignal;
         log("Watcher", `Session ended signal for ${sessionId}`);
-        this.endedSignals.set(sessionId, endSignal);
-        // Clear all signals for this session
-        this.workingSignals.delete(sessionId);
-        this.pendingPermissions.delete(sessionId);
-        this.stopSignals.delete(sessionId);
-
-        // Update session — worktree sessions go to "review", others to "idle"
         const session = this.sessions.get(sessionId);
-        if (session) {
-          const previousStatus = session.status;
-          session.hasWorkingSignal = false;
-          session.hasStopSignal = false;
-          session.hasEndedSignal = true;
-          session.pendingPermission = undefined;
-          const endedStatus = session.isWorktree ? "review" : "idle";
-          session.status = {
-            ...session.status,
-            status: endedStatus,
-            hasPendingToolUse: false,
-          };
-          this.emit("session", { type: "updated", session, previousStatus } satisfies SessionEvent);
-        }
+        if (session) session.isHookDriven = true;
+        this.transitionSession(sessionId, { type: "ENDED" });
       } else if (type === "task" && parsed.toolUseId) {
         const taskSignal = data as TaskSignal;
         log("Watcher", `Task signal for session ${sessionId}: ${taskSignal.agent_type || "unknown"} - ${taskSignal.description || ""}`);
@@ -446,36 +390,24 @@ export class SessionWatcher extends EventEmitter {
     const { sessionId, type } = parsed;
     log("Watcher", `Signal removed for session ${sessionId}: ${type}`);
 
-    if (type === "working") {
-      this.workingSignals.delete(sessionId);
-      const session = this.sessions.get(sessionId);
-      if (session) {
-        session.hasWorkingSignal = false;
-      }
-    } else if (type === "permission") {
-      this.pendingPermissions.delete(sessionId);
+    if (type === "permission") {
       // Cancel debounce timer
       const timer = this.permissionTimers.get(sessionId);
       if (timer) { clearTimeout(timer); this.permissionTimers.delete(sessionId); }
 
+      // If debounce already fired (machine is in needs_approval), fall back to JSONL-derived state
       const session = this.sessions.get(sessionId);
-      if (session && session.pendingPermission) {
-        const previousStatus = session.status;
+      if (session?.machineState === "needs_approval") {
         session.pendingPermission = undefined;
-        session.status = deriveStatus(session.entries);
-        this.emit("session", { type: "updated", session, previousStatus } satisfies SessionEvent);
-      }
-    } else if (type === "stop") {
-      this.stopSignals.delete(sessionId);
-      const session = this.sessions.get(sessionId);
-      if (session) {
-        session.hasStopSignal = false;
-      }
-    } else if (type === "ended") {
-      this.endedSignals.delete(sessionId);
-      const session = this.sessions.get(sessionId);
-      if (session) {
-        session.hasEndedSignal = false;
+        const { state } = replayEntries(session.entries, session.isWorktree);
+        const nextState = state;
+        if (nextState !== session.machineState) {
+          session.machineState = nextState;
+          const previousStatus = session.status;
+          const published = machineStateToPublishedStatus(nextState);
+          session.status = { ...session.status, status: published.status, hasPendingToolUse: published.hasPendingToolUse };
+          this.emit("session", { type: "updated", session, previousStatus } satisfies SessionEvent);
+        }
       }
     } else if (type === "task" && parsed.toolUseId) {
       const sessionTasks = this.taskSignals.get(sessionId);
@@ -530,41 +462,6 @@ export class SessionWatcher extends EventEmitter {
     this.permissionTimers.clear();
   }
 
-  /**
-   * Clear a pending permission when tool completes (called when tool_result is seen).
-   */
-  async clearPendingPermission(sessionId: string): Promise<void> {
-    if (!this.pendingPermissions.has(sessionId)) return;
-
-    this.pendingPermissions.delete(sessionId);
-
-    // Cancel debounce timer
-    const timer = this.permissionTimers.get(sessionId);
-    if (timer) { clearTimeout(timer); this.permissionTimers.delete(sessionId); }
-
-    // Try to delete the file
-    try {
-      await unlink(join(SIGNALS_DIR, `${sessionId}.permission.json`));
-    } catch {
-      // File may already be deleted
-    }
-  }
-
-  /**
-   * Clear stop signal for a session (called when new user prompt is seen).
-   */
-  async clearStopSignal(sessionId: string): Promise<void> {
-    if (!this.stopSignals.has(sessionId)) return;
-
-    this.stopSignals.delete(sessionId);
-
-    try {
-      await unlink(join(SIGNALS_DIR, `${sessionId}.stop.json`));
-    } catch {
-      // File may already be deleted
-    }
-  }
-
   getSessions(): Map<string, SessionState> {
     return this.sessions;
   }
@@ -575,43 +472,21 @@ export class SessionWatcher extends EventEmitter {
    */
   private async checkStaleSessions(): Promise<void> {
     for (const session of this.sessions.values()) {
-      // Check working sessions for stale timeout
-      if (session.status.status === "working") {
-        // Hook signals are authoritative — skip stale check if working signal is active
-        if (session.hasWorkingSignal) continue;
-
-        // Re-derive status which will apply STALE_TIMEOUT
-        const newStatus = deriveStatus(session.entries);
-
-        // If status changed, emit update
-        if (statusChanged(session.status, newStatus)) {
-          const previousStatus = session.status;
-          session.status = newStatus;
-
-          this.emit("session", {
-            type: "updated",
-            session,
-            previousStatus,
-          } satisfies SessionEvent);
+      // Stale timeout: working sessions without hook signals get STOP after 15s inactivity
+      if (session.machineState === "working" && !session.isHookDriven) {
+        const elapsed = Date.now() - new Date(session.status.lastActivityAt).getTime();
+        if (elapsed > 15_000) {
+          this.transitionSession(session.sessionId, { type: "STOP" });
         }
-        continue;
       }
 
-      // Check review sessions — transition to idle if worktree was deleted
-      if (session.status.status === "review" && session.worktreePath) {
+      // Worktree existence check: review sessions transition to idle if worktree was deleted
+      if (session.machineState === "review" && session.worktreePath) {
         try {
           await access(session.worktreePath, constants.F_OK);
-          // Worktree still exists, keep in review
         } catch {
-          // Worktree deleted — transition to idle
-          const previousStatus = session.status;
-          session.status = { ...session.status, status: "idle" };
           log("Watcher", `Worktree deleted for ${session.sessionId.slice(0, 8)}, review → idle`);
-          this.emit("session", {
-            type: "updated",
-            session,
-            previousStatus,
-          } satisfies SessionEvent);
+          this.transitionSession(session.sessionId, { type: "WORKTREE_DELETED" });
         }
       }
     }
@@ -754,37 +629,24 @@ export class SessionWatcher extends EventEmitter {
         }
       }
 
-      // Check if any new entry is a tool_result - if so, clear pending permission
-      const hasToolResult = newEntries.some((entry) => {
-        if (entry.type === "user") {
-          const content = (entry as { message: { content: unknown } }).message.content;
-          if (Array.isArray(content)) {
-            return content.some((block) => block.type === "tool_result");
-          }
-        }
-        return false;
-      });
+      // Derive status from all JSONL entries via the state machine replay
+      const { state: replayedState, lastActivityAt, messageCount } = replayEntries(allEntries, gitInfo.isWorktree);
+      const published = machineStateToPublishedStatus(replayedState);
 
-      if (hasToolResult && this.pendingPermissions.has(sessionId)) {
-        await this.clearPendingPermission(sessionId);
-      }
+      // For existing sessions, use current machine state (hook-driven transitions
+      // are already applied). For new sessions, use the JSONL-replayed state.
+      const machineState = existingSession ? existingSession.machineState : replayedState;
+      const machinePublished = existingSession
+        ? machineStateToPublishedStatus(machineState)
+        : published;
 
-      // Check if any new entry is a user prompt (new turn starting) - if so, clear stop signal
-      const hasUserPrompt = newEntries.some((entry) => {
-        if (entry.type === "user") {
-          const content = (entry as { message: { content: unknown } }).message.content;
-          // User prompt has string content, not tool_result array
-          return typeof content === "string";
-        }
-        return false;
-      });
-
-      if (hasUserPrompt && this.stopSignals.has(sessionId)) {
-        await this.clearStopSignal(sessionId);
-      }
-
-      // Derive base status from JSONL entries (for metadata like messageCount)
-      let status = deriveStatus(allEntries);
+      const status: StatusResult = {
+        status: machinePublished.status,
+        hasPendingToolUse: machinePublished.hasPendingToolUse,
+        lastRole: "assistant",
+        lastActivityAt,
+        messageCount,
+      };
       const previousStatus = existingSession?.status;
 
       // Extract active tasks and todo progress from entries (JSONL fallback)
@@ -793,35 +655,26 @@ export class SessionWatcher extends EventEmitter {
       // If compacting signal exists and new entries arrived, compaction is done
       if (newEntries.length > 0 && this.compactingSignals.has(sessionId)) {
         this.compactingSignals.delete(sessionId);
-        try {
-          await unlink(join(SIGNALS_DIR, `${sessionId}.compacting.json`));
-        } catch {
-          // File may already be deleted
+        this.cleanupSignalFile(sessionId, "compacting");
+      }
+
+      // Process new entries through machine for existing sessions
+      // (drives transitions from JSONL when hooks are not present)
+      if (existingSession && !existingSession.isHookDriven) {
+        let currentState = existingSession.machineState;
+        for (const entry of newEntries) {
+          const event = logEntryToSessionEvent(entry);
+          if (event) {
+            currentState = transition(currentState, event, gitInfo.isWorktree);
+          }
+        }
+        if (currentState !== existingSession.machineState) {
+          existingSession.machineState = currentState;
+          const newPublished = machineStateToPublishedStatus(currentState);
+          status.status = newPublished.status;
+          status.hasPendingToolUse = newPublished.hasPendingToolUse;
         }
       }
-
-      // Hook signals are authoritative for status - override JSONL-derived status
-      const pendingPermission = this.pendingPermissions.get(sessionId);
-      const hasWorkingSig = this.workingSignals.has(sessionId);
-      const hasStopSig = this.stopSignals.has(sessionId);
-      const hasEndedSig = this.endedSignals.has(sessionId);
-
-      if (hasEndedSig) {
-        // Session ended — worktree sessions go to "review", others to "idle"
-        const endedStatus = gitInfo.isWorktree ? "review" : "idle";
-        status = { ...status, status: endedStatus, hasPendingToolUse: false };
-      } else if (pendingPermission && !this.permissionTimers.has(sessionId)) {
-        // Waiting for permission approval (debounce period has passed)
-        status = { ...status, status: "waiting", hasPendingToolUse: true };
-      } else if (hasStopSig) {
-        // Claude's turn ended — worktree sessions go to "review" (no interactive user), others wait
-        const stopStatus = gitInfo.isWorktree ? "review" : "waiting";
-        status = { ...status, status: stopStatus, hasPendingToolUse: false };
-      } else if (hasWorkingSig) {
-        // User started turn - working
-        status = { ...status, status: "working", hasPendingToolUse: false };
-      }
-      // If no hook signals, use JSONL-derived status (fallback for sessions without hooks)
 
       // Build session state - prefer branch from git info over log entry
       const session: SessionState = {
@@ -841,10 +694,9 @@ export class SessionWatcher extends EventEmitter {
         isWorktree: gitInfo.isWorktree,
         worktreePath: gitInfo.worktreePath,
         branchChanged,
-        pendingPermission,
-        hasWorkingSignal: hasWorkingSig,
-        hasStopSignal: hasStopSig,
-        hasEndedSignal: hasEndedSig,
+        machineState: existingSession ? existingSession.machineState : replayedState,
+        isHookDriven: existingSession?.isHookDriven ?? false,
+        pendingPermission: existingSession?.pendingPermission,
         // Hook signals are authoritative for active tasks.
         // JSONL fallback only reports tasks when session is working — if the turn
         // ended (waiting/idle), all tasks completed even if tool_result matching

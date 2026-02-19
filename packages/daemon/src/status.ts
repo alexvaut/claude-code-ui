@@ -4,24 +4,27 @@ import type {
   SessionStatus,
 } from "./types.js";
 import {
-  deriveStatusFromMachine,
-  machineStatusToResult,
+  replayEntries,
+  machineStateToPublishedStatus,
 } from "./status-machine.js";
 
 /**
- * Derive session status from log entries using XState state machine.
+ * Derive session status from log entries using the unified state machine.
  *
- * Status logic:
- * - "working": Claude is actively processing (streaming or executing tools)
- * - "waiting": Claude finished, waiting for user input or approval
- *   - hasPendingToolUse: true if waiting for tool approval
- *
- * Note: "idle" status is determined by the UI based on elapsed time since lastActivityAt
+ * Replays all entries through the pure transition function and maps
+ * the final machine state to a StatusResult.
  */
-export function deriveStatus(entries: LogEntry[]): StatusResult {
-  // Use the state machine for status derivation
-  const { status: machineStatus, context } = deriveStatusFromMachine(entries);
-  return machineStatusToResult(machineStatus, context);
+export function deriveStatus(entries: LogEntry[], isWorktree = false): StatusResult {
+  const { state, lastActivityAt, messageCount } = replayEntries(entries, isWorktree);
+  const { status, hasPendingToolUse } = machineStateToPublishedStatus(state);
+
+  return {
+    status,
+    lastRole: "assistant",
+    hasPendingToolUse,
+    lastActivityAt,
+    messageCount,
+  };
 }
 
 /**

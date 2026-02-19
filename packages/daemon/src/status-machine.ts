@@ -1,325 +1,235 @@
 /**
- * XState state machine for session status detection.
+ * Unified session state machine.
  *
- * This replaces the ad-hoc if-statements with a proper state machine
- * that makes transitions explicit and testable.
- */
-
-import { setup, createActor } from "xstate";
-import type { LogEntry, AssistantEntry, UserEntry, SystemEntry } from "./types.js";
-
-// Context holds computed state from log entries
-export interface StatusContext {
-  lastActivityAt: string;
-  messageCount: number;
-  hasPendingToolUse: boolean;
-  pendingToolIds: string[];
-}
-
-// Events derived from log entries
-export type StatusEvent =
-  | { type: "USER_PROMPT"; timestamp: string }
-  | { type: "TOOL_RESULT"; timestamp: string; toolUseIds: string[] }
-  | { type: "ASSISTANT_STREAMING"; timestamp: string }
-  | { type: "ASSISTANT_TOOL_USE"; timestamp: string; toolUseIds: string[] }
-  | { type: "TURN_END"; timestamp: string }
-  | { type: "STALE_TIMEOUT" };
-
-// The three possible status states (idle is determined by UI based on elapsed time)
-export type StatusState = "working" | "waiting_for_approval" | "waiting_for_input";
-
-/**
- * State machine for session status.
+ * A single pure transition function handles ALL events — from JSONL entries,
+ * hook signals, timers, and periodic checks. The machine state IS the session
+ * status. No separate signal maps or priority chains needed.
  *
  * States:
- * - working: Claude is actively processing
- * - waiting_for_approval: Tool use needs user approval
- * - waiting_for_input: Claude finished, waiting for user
+ *   working         — Claude is actively processing
+ *   needs_approval  — Tool use awaiting user approval
+ *   waiting         — Claude finished, waiting for user input
+ *   review          — Worktree session paused (turn ended or session closed)
+ *   idle            — Session ended (non-worktree)
  *
- * Note: "idle" status is determined by the UI based on elapsed time since lastActivityAt
+ * Transition table:
+ *
+ *              WORKING        STOP(wt)   STOP(!wt)  ENDED(wt)  ENDED(!wt)  PERM_REQ        WORKTREE_DEL
+ *   working       ·           review     waiting    review     idle        needs_approval   ·
+ *   needs_appr  working       review     waiting    review     idle        needs_approval   ·
+ *   waiting     working         ·          ·          ·          ·         needs_approval   ·
+ *   review      working         ·          ·          ·          ·            ·             idle
+ *   idle        working         ·          ·          ·          ·            ·              ·
+ *
+ *   · = no transition (stay in current state)
  */
-export const statusMachine = setup({
-  types: {
-    context: {} as StatusContext,
-    events: {} as StatusEvent,
-  },
-}).createMachine({
-  id: "sessionStatus",
-  initial: "waiting_for_input",
-  // Use a factory function to ensure each actor gets a fresh context
-  context: () => ({
-    lastActivityAt: "",
-    messageCount: 0,
-    hasPendingToolUse: false,
-    pendingToolIds: [],
-  }),
-  states: {
-    working: {
-      on: {
-        USER_PROMPT: {
-          // Another user prompt while working (e.g., turn ended without system event)
-          actions: ({ context, event }) => {
-            context.lastActivityAt = event.timestamp;
-            context.messageCount += 1;
-            context.hasPendingToolUse = false;
-            context.pendingToolIds = [];
-          },
-        },
-        ASSISTANT_STREAMING: {
-          actions: ({ context, event }) => {
-            context.lastActivityAt = event.timestamp;
-          },
-        },
-        ASSISTANT_TOOL_USE: {
-          // Immediately transition to waiting_for_approval - tools that need approval
-          // will wait for user action, auto-approved tools are already filtered out
-          target: "waiting_for_approval",
-          actions: ({ context, event }) => {
-            context.lastActivityAt = event.timestamp;
-            context.messageCount += 1;
-            context.hasPendingToolUse = true;
-            context.pendingToolIds = event.toolUseIds;
-          },
-        },
-        TOOL_RESULT: {
-          // Tool completed - clear pending state, stay working
-          actions: ({ context, event }) => {
-            context.lastActivityAt = event.timestamp;
-            context.messageCount += 1;
-            const remaining = context.pendingToolIds.filter(
-              (id) => !event.toolUseIds.includes(id)
-            );
-            context.pendingToolIds = remaining;
-            context.hasPendingToolUse = remaining.length > 0;
-          },
-        },
-        TURN_END: {
-          target: "waiting_for_input",
-          actions: ({ context, event }) => {
-            context.lastActivityAt = event.timestamp;
-            context.hasPendingToolUse = false;
-            context.pendingToolIds = [];
-          },
-        },
-        STALE_TIMEOUT: {
-          target: "waiting_for_input",
-          actions: ({ context }) => {
-            context.hasPendingToolUse = false;
-          },
-        },
-      },
-    },
-    waiting_for_approval: {
-      on: {
-        TOOL_RESULT: {
-          target: "working",
-          actions: ({ context, event }) => {
-            context.lastActivityAt = event.timestamp;
-            context.messageCount += 1;
-            // Remove approved tools from pending
-            const remaining = context.pendingToolIds.filter(
-              (id) => !event.toolUseIds.includes(id)
-            );
-            context.pendingToolIds = remaining;
-            context.hasPendingToolUse = remaining.length > 0;
-          },
-        },
-        USER_PROMPT: {
-          // User started new turn - clears pending approval
-          target: "working",
-          actions: ({ context, event }) => {
-            context.lastActivityAt = event.timestamp;
-            context.messageCount += 1;
-            context.hasPendingToolUse = false;
-            context.pendingToolIds = [];
-          },
-        },
-        TURN_END: {
-          // Turn ended without approval (e.g., session closed)
-          target: "waiting_for_input",
-          actions: ({ context, event }) => {
-            context.lastActivityAt = event.timestamp;
-            context.hasPendingToolUse = false;
-            context.pendingToolIds = [];
-          },
-        },
-        STALE_TIMEOUT: {
-          // Approval pending too long - likely already resolved
-          target: "waiting_for_input",
-          actions: ({ context }) => {
-            context.hasPendingToolUse = false;
-            context.pendingToolIds = [];
-          },
-        },
-      },
-    },
-    waiting_for_input: {
-      on: {
-        USER_PROMPT: {
-          target: "working",
-          actions: ({ context, event }) => {
-            context.lastActivityAt = event.timestamp;
-            context.messageCount += 1;
-          },
-        },
-        // Handle assistant events for partial logs (e.g., resumed sessions)
-        ASSISTANT_STREAMING: {
-          actions: ({ context, event }) => {
-            context.lastActivityAt = event.timestamp;
-          },
-        },
-        TURN_END: {
-          actions: ({ context, event }) => {
-            context.lastActivityAt = event.timestamp;
-          },
-        },
-      },
-    },
-  },
-});
+
+import type { LogEntry, AssistantEntry, UserEntry, SystemEntry } from "./types.js";
+
+// ---------------------------------------------------------------------------
+// Machine types
+// ---------------------------------------------------------------------------
+
+export type SessionMachineState =
+  | "working"
+  | "needs_approval"
+  | "waiting"
+  | "review"
+  | "idle";
+
+export type SessionEvent =
+  | { type: "WORKING" }
+  | { type: "STOP" }
+  | { type: "ENDED" }
+  | { type: "PERMISSION_REQUEST" }
+  | { type: "WORKTREE_DELETED" };
+
+// ---------------------------------------------------------------------------
+// Pure transition function
+// ---------------------------------------------------------------------------
+
+export function transition(
+  state: SessionMachineState,
+  event: SessionEvent,
+  isWorktree: boolean,
+): SessionMachineState {
+  switch (state) {
+    case "working":
+      switch (event.type) {
+        case "STOP": return isWorktree ? "review" : "waiting";
+        case "ENDED": return isWorktree ? "review" : "idle";
+        case "PERMISSION_REQUEST": return "needs_approval";
+        default: return state;
+      }
+
+    case "needs_approval":
+      switch (event.type) {
+        case "WORKING": return "working";
+        case "STOP": return isWorktree ? "review" : "waiting";
+        case "ENDED": return isWorktree ? "review" : "idle";
+        case "PERMISSION_REQUEST": return "needs_approval";
+        default: return state;
+      }
+
+    case "waiting":
+      switch (event.type) {
+        case "WORKING": return "working";
+        case "PERMISSION_REQUEST": return "needs_approval";
+        default: return state;
+      }
+
+    case "review":
+      switch (event.type) {
+        case "WORKING": return "working";
+        case "WORKTREE_DELETED": return "idle";
+        default: return state;
+      }
+
+    case "idle":
+      switch (event.type) {
+        case "WORKING": return "working";
+        default: return state;
+      }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Published status mapping
+// ---------------------------------------------------------------------------
+
+export function machineStateToPublishedStatus(state: SessionMachineState): {
+  status: "working" | "waiting" | "review" | "idle";
+  hasPendingToolUse: boolean;
+} {
+  switch (state) {
+    case "working": return { status: "working", hasPendingToolUse: false };
+    case "needs_approval": return { status: "waiting", hasPendingToolUse: true };
+    case "waiting": return { status: "waiting", hasPendingToolUse: false };
+    case "review": return { status: "review", hasPendingToolUse: false };
+    case "idle": return { status: "idle", hasPendingToolUse: false };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// JSONL → machine event mapping
+// ---------------------------------------------------------------------------
 
 /**
- * Convert a log entry to a status event.
+ * Convert a JSONL log entry to a machine event.
+ * Returns null if the entry doesn't cause a state change.
  */
-export function logEntryToEvent(entry: LogEntry): StatusEvent | null {
+export function logEntryToSessionEvent(entry: LogEntry): SessionEvent | null {
   if (entry.type === "user") {
     const userEntry = entry as UserEntry;
     const content = userEntry.message.content;
 
     if (typeof content === "string") {
-      // Human prompt (string form)
-      return { type: "USER_PROMPT", timestamp: userEntry.timestamp };
+      return { type: "WORKING" };
     } else if (Array.isArray(content)) {
-      // Check for tool results first
-      const toolUseIds = content
-        .filter((b) => b.type === "tool_result")
-        .map((b) => b.tool_use_id);
-      if (toolUseIds.length > 0) {
-        return { type: "TOOL_RESULT", timestamp: userEntry.timestamp, toolUseIds };
+      // tool_result → WORKING (tool completed, back to work)
+      const hasToolResult = content.some((b) => b.type === "tool_result");
+      if (hasToolResult) {
+        return { type: "WORKING" };
       }
-      // Check for text blocks (user prompt in array form with images, etc.)
+      // Text blocks in array form (user prompt with images, etc.)
       const hasTextBlock = content.some((b) => b.type === "text");
       if (hasTextBlock) {
-        return { type: "USER_PROMPT", timestamp: userEntry.timestamp };
+        return { type: "WORKING" };
       }
     }
   }
 
   if (entry.type === "assistant") {
     const assistantEntry = entry as AssistantEntry;
-    // Filter out tools that are typically auto-approved and don't need user approval
-    // These tools run automatically without user intervention
-    const autoApprovedTools = new Set([
-      "Task",           // Subagents
-      "Read",           // File reading
-      "Glob",           // File pattern matching
-      "Grep",           // Content search
-      "TodoWrite",      // Todo list management
-      "TaskOutput",     // Getting task output
-      "EnterPlanMode",  // Plan mode toggle
-      "ExitPlanMode",   // Plan mode toggle
-      // Note: WebFetch, WebSearch, NotebookEdit, AskUserQuestion can require approval
-      // depending on user configuration, so they're not auto-approved
-    ]);
-    const toolUseBlocks = assistantEntry.message.content.filter(
-      (b) => b.type === "tool_use" && !autoApprovedTools.has(b.name)
+    const hasToolUse = assistantEntry.message.content.some(
+      (b) => b.type === "tool_use"
     );
 
-    if (toolUseBlocks.length > 0) {
-      const toolUseIds = toolUseBlocks.map((b) => b.type === "tool_use" ? b.id : "");
-      return { type: "ASSISTANT_TOOL_USE", timestamp: assistantEntry.timestamp, toolUseIds };
+    if (hasToolUse) {
+      // From JSONL alone we can't distinguish "waiting for approval" from
+      // "auto-approved and executing". Treat all tool_use as WORKING — the
+      // PERMISSION_REQUEST event should only come from the PermissionRequest hook
+      // which fires precisely when user approval is actually needed.
+      return { type: "WORKING" };
     }
 
-    // Streaming assistant message (no tool_use, or only Task tools)
-    return { type: "ASSISTANT_STREAMING", timestamp: assistantEntry.timestamp };
+    // Text-only assistant message — no state change
+    return null;
   }
 
   if (entry.type === "system") {
     const systemEntry = entry as SystemEntry;
     if (systemEntry.subtype === "turn_duration" || systemEntry.subtype === "stop_hook_summary") {
-      return { type: "TURN_END", timestamp: systemEntry.timestamp };
+      return { type: "STOP" };
     }
   }
 
   return null;
 }
 
-/**
- * Derive status by running all log entries through the state machine.
- */
-export function deriveStatusFromMachine(entries: LogEntry[]): {
-  status: StatusState;
-  context: StatusContext;
-} {
-  // Create a fresh actor and start it
-  const actor = createActor(statusMachine);
-  actor.start();
+// ---------------------------------------------------------------------------
+// Replay: derive state + metadata from a full entry list
+// ---------------------------------------------------------------------------
 
-  // Process each entry
-  for (const entry of entries) {
-    const event = logEntryToEvent(entry);
-    if (event) {
-      actor.send(event);
-    }
-  }
+const STALE_TIMEOUT_MS = 15 * 1000;
 
-  // Get current state
-  const snapshot = actor.getSnapshot();
-  let context = snapshot.context;
-  let stateValue = snapshot.value as StatusState;
-
-  // Check for stale sessions (working state with no activity for a while)
-  const now = Date.now();
-  const lastActivityTime = context.lastActivityAt ? new Date(context.lastActivityAt).getTime() : 0;
-  const timeSinceActivity = now - lastActivityTime;
-
-  const STALE_TIMEOUT_MS = 15 * 1000; // 15 seconds - detect stale sessions quickly
-
-  // Apply stale timeout for stale working or waiting_for_approval states
-  // (idle status is handled by the UI based on elapsed time)
-  if (timeSinceActivity > STALE_TIMEOUT_MS) {
-    if (stateValue === "working" && !context.hasPendingToolUse) {
-      // Stale working without tool use - probably turn ended without marker
-      actor.send({ type: "STALE_TIMEOUT" });
-    } else if (stateValue === "waiting_for_approval") {
-      // Stale waiting for approval - tool probably already ran
-      actor.send({ type: "STALE_TIMEOUT" });
-    }
-  }
-
-  // Get final state
-  const finalSnapshot = actor.getSnapshot();
-  actor.stop();
-
-  return {
-    status: finalSnapshot.value as StatusState,
-    context: finalSnapshot.context,
-  };
+export interface ReplayResult {
+  state: SessionMachineState;
+  lastActivityAt: string;
+  messageCount: number;
 }
 
 /**
- * Map machine status to the existing StatusResult format for compatibility.
- * Note: "idle" status is determined by the UI based on elapsed time.
+ * Replay all log entries through the machine to derive current state + metadata.
+ * Used for initial session load and JSONL-only (no hooks) status derivation.
  */
-export function machineStatusToResult(
-  machineStatus: StatusState,
-  context: StatusContext
-): {
-  status: "working" | "waiting";
-  lastRole: "user" | "assistant";
-  hasPendingToolUse: boolean;
-  lastActivityAt: string;
-  messageCount: number;
-} {
-  // Map the 3 machine states to 2 UI states (idle is handled by UI)
-  const status: "working" | "waiting" =
-    machineStatus === "working" ? "working" : "waiting";
+export function replayEntries(
+  entries: LogEntry[],
+  isWorktree: boolean,
+): ReplayResult {
+  let state: SessionMachineState = "waiting";
+  let lastActivityAt = "";
+  let messageCount = 0;
 
-  return {
-    status,
-    lastRole: "assistant", // Could track this in context if needed
-    hasPendingToolUse: context.hasPendingToolUse,
-    lastActivityAt: context.lastActivityAt,
-    messageCount: context.messageCount,
-  };
+  for (const entry of entries) {
+    // Update metadata from entry timestamp
+    const timestamp = "timestamp" in entry ? (entry as { timestamp: string }).timestamp : "";
+    if (timestamp) {
+      lastActivityAt = timestamp;
+    }
+
+    // Count user prompts and tool-use assistant messages
+    if (entry.type === "user") {
+      const content = (entry as UserEntry).message.content;
+      if (typeof content === "string") {
+        messageCount += 1;
+      } else if (Array.isArray(content)) {
+        const hasToolResult = content.some((b) => b.type === "tool_result");
+        if (hasToolResult) messageCount += 1;
+        else if (content.some((b) => b.type === "text")) messageCount += 1;
+      }
+    } else if (entry.type === "assistant") {
+      const assistantEntry = entry as AssistantEntry;
+      const hasToolUse = assistantEntry.message.content.some((b) => b.type === "tool_use");
+      if (hasToolUse) messageCount += 1;
+    }
+
+    // Transition state
+    const event = logEntryToSessionEvent(entry);
+    if (event) {
+      state = transition(state, event, isWorktree);
+    }
+  }
+
+  // Apply stale timeout for sessions with old activity
+  if (lastActivityAt) {
+    const elapsed = Date.now() - new Date(lastActivityAt).getTime();
+    if (elapsed > STALE_TIMEOUT_MS) {
+      if (state === "working" || state === "needs_approval") {
+        state = transition(state, { type: "STOP" }, isWorktree);
+      }
+    }
+  }
+
+  return { state, lastActivityAt, messageCount };
 }
