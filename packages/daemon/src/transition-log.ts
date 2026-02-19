@@ -26,6 +26,15 @@ export interface TransitionMeta {
   entryCount?: number;
 }
 
+export interface HookEventMeta {
+  signal?: string;
+  tool?: string;
+  agent?: string;
+  desc?: string;
+  reason?: string;
+  id?: string;
+}
+
 function formatLine(
   from: SessionMachineState | null,
   to: SessionMachineState,
@@ -68,6 +77,43 @@ export function appendTransition(
   }
 
   const line = formatLine(from, to, meta);
+
+  const write = async () => {
+    if (!dirEnsured) {
+      await mkdir(LOGS_DIR, { recursive: true });
+      dirEnsured = true;
+    }
+    await appendFile(join(LOGS_DIR, `${sessionId}.log`), line);
+  };
+
+  write().catch(() => {});
+}
+
+function formatHookLine(hookName: string, meta?: HookEventMeta): string {
+  const ts = new Date().toISOString();
+  const stateCol = `[hook] ${hookName}`;
+
+  const parts: string[] = [];
+  if (meta?.tool) parts.push(`tool:${meta.tool}`);
+  if (meta?.agent) parts.push(`agent:${meta.agent}`);
+  if (meta?.desc) parts.push(`desc:${meta.desc}`);
+  if (meta?.reason) parts.push(`reason:${meta.reason}`);
+  if (meta?.id) parts.push(`id:${meta.id}`);
+  if (meta?.signal) parts.push(`signal:${meta.signal}`);
+
+  return `${ts}  ${stateCol.padEnd(30)}  ${parts.join("  ")}\n`;
+}
+
+/**
+ * Append a hook event line to the session's log file.
+ * Fire-and-forget — errors are silently ignored.
+ */
+export function appendHookEvent(
+  sessionId: string,
+  hookName: string,
+  meta?: HookEventMeta,
+): void {
+  const line = formatHookLine(hookName, meta);
 
   const write = async () => {
     if (!dirEnsured) {

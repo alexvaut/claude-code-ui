@@ -19,7 +19,7 @@ import {
 import { getGitInfoCached, type GitInfo } from "./git.js";
 import type { LogEntry, SessionMetadata, StatusResult } from "./types.js";
 import { log } from "./log.js";
-import { appendTransition, type TransitionMeta } from "./transition-log.js";
+import { appendTransition, appendHookEvent, type TransitionMeta } from "./transition-log.js";
 
 const CLAUDE_PROJECTS_DIR = `${process.env.HOME}/.claude/projects`;
 const SIGNALS_DIR = `${process.env.HOME}/.claude/session-signals`;
@@ -115,6 +115,7 @@ export class SessionWatcher extends EventEmitter {
   private taskSignals = new Map<string, Map<string, ActiveTask>>(); // sessionId → toolUseId → ActiveTask
   private toolSignals = new Map<string, Map<string, ActiveTool>>(); // sessionId → toolUseId → ActiveTool
   private compactingSignals = new Map<string, string>(); // sessionId → startedAt
+  private loggedHooks = new Set<string>(); // dedup keys for hook event logging
   private debounceTimers = new Map<string, NodeJS.Timeout>();
   private permissionTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private debounceMs: number;
@@ -132,6 +133,17 @@ export class SessionWatcher extends EventEmitter {
    */
   getPendingPermission(sessionId: string): PendingPermission | undefined {
     return this.sessions.get(sessionId)?.pendingPermission;
+  }
+
+  /**
+   * Log a hook event, deduplicating by key.
+   * Returns true if the event was logged (new), false if it was a duplicate.
+   */
+  private logHook(dedupKey: string, sessionId: string, hookName: string, meta?: Parameters<typeof appendHookEvent>[2]): boolean {
+    if (this.loggedHooks.has(dedupKey)) return false;
+    this.loggedHooks.add(dedupKey);
+    appendHookEvent(sessionId, hookName, meta);
+    return true;
   }
 
   /**
@@ -309,10 +321,12 @@ export class SessionWatcher extends EventEmitter {
 
       if (type === "working") {
         log("Watcher", `Working signal for session ${sessionId}`);
+        this.logHook(`${sessionId}:working:${data.working_since}`, sessionId, "working", { signal: "working.json" });
         this.transitionSession(sessionId, { type: "WORKING" }, { event: "WORKING", source: "hook", signal: "working.json" });
       } else if (type === "permission") {
         const permission = data as PendingPermission;
         log("Watcher", `Pending permission for session ${sessionId}: ${permission.tool_name}`);
+        this.logHook(`${sessionId}:permission:${permission.pending_since}`, sessionId, "permission_request", { tool: permission.tool_name, signal: "permission.json" });
 
         // Cancel any existing debounce timer
         const existingTimer = this.permissionTimers.get(sessionId);
@@ -329,13 +343,16 @@ export class SessionWatcher extends EventEmitter {
         }, this.permissionDelayMs));
       } else if (type === "stop") {
         log("Watcher", `Stop signal for session ${sessionId}`);
+        this.logHook(`${sessionId}:stop:${data.stopped_at}`, sessionId, "stop", { signal: "stop.json" });
         this.transitionSession(sessionId, { type: "STOP" }, { event: "STOP", source: "hook", signal: "stop.json" });
       } else if (type === "ended") {
         log("Watcher", `Session ended signal for ${sessionId}`);
+        this.logHook(`${sessionId}:ended:${data.ended_at}`, sessionId, "ended", { reason: data.reason, signal: "ended.json" });
         this.transitionSession(sessionId, { type: "ENDED" }, { event: "ENDED", source: "hook", signal: "ended.json" });
       } else if (type === "tool" && parsed.toolUseId) {
         const toolSignal = data as ToolSignal;
         log("Watcher", `Tool signal for session ${sessionId}: ${toolSignal.tool_name} (${parsed.toolUseId})`);
+        this.logHook(`${sessionId}:tool:${parsed.toolUseId}`, sessionId, "tool_start", { tool: toolSignal.tool_name, id: parsed.toolUseId, signal: `tool.${parsed.toolUseId}.json` });
 
         // Store in tool signals map
         let sessionTools = this.toolSignals.get(sessionId);
@@ -360,6 +377,7 @@ export class SessionWatcher extends EventEmitter {
       } else if (type === "task" && parsed.toolUseId) {
         const taskSignal = data as TaskSignal;
         log("Watcher", `Task signal for session ${sessionId}: ${taskSignal.agent_type || "unknown"} - ${taskSignal.description || ""}`);
+        this.logHook(`${sessionId}:task:${parsed.toolUseId}`, sessionId, "task_start", { agent: taskSignal.agent_type, desc: taskSignal.description, id: parsed.toolUseId, signal: `task.${parsed.toolUseId}.json` });
 
         // Store in task signals map
         let sessionTasks = this.taskSignals.get(sessionId);
@@ -388,6 +406,7 @@ export class SessionWatcher extends EventEmitter {
       } else if (type === "compacting") {
         const compactSignal = data as CompactingSignal;
         log("Watcher", `Compacting signal for session ${sessionId}`);
+        this.logHook(`${sessionId}:compacting:${compactSignal.started_at}`, sessionId, "compacting", { signal: "compacting.json" });
         this.compactingSignals.set(sessionId, compactSignal.started_at || new Date().toISOString());
 
         // Update session
@@ -447,6 +466,7 @@ export class SessionWatcher extends EventEmitter {
     log("Watcher", `Signal removed for session ${sessionId}: ${type}`);
 
     if (type === "permission") {
+      appendHookEvent(sessionId, "permission_resolved", { signal: "permission.json" });
       // Cancel debounce timer
       const timer = this.permissionTimers.get(sessionId);
       if (timer) { clearTimeout(timer); this.permissionTimers.delete(sessionId); }
@@ -460,6 +480,8 @@ export class SessionWatcher extends EventEmitter {
       }
     } else if (type === "tool" && parsed.toolUseId) {
       const sessionTools = this.toolSignals.get(sessionId);
+      const removedTool = sessionTools?.get(parsed.toolUseId);
+      appendHookEvent(sessionId, "tool_end", { tool: removedTool?.toolName, id: parsed.toolUseId, signal: `tool.${parsed.toolUseId}.json` });
       if (sessionTools) {
         sessionTools.delete(parsed.toolUseId);
         if (sessionTools.size === 0) {
@@ -473,6 +495,8 @@ export class SessionWatcher extends EventEmitter {
       }
     } else if (type === "task" && parsed.toolUseId) {
       const sessionTasks = this.taskSignals.get(sessionId);
+      const removedTask = sessionTasks?.get(parsed.toolUseId);
+      appendHookEvent(sessionId, "task_end", { agent: removedTask?.agentType, id: parsed.toolUseId, signal: `task.${parsed.toolUseId}.json` });
       if (sessionTasks) {
         sessionTasks.delete(parsed.toolUseId);
         if (sessionTasks.size === 0) {
@@ -492,6 +516,7 @@ export class SessionWatcher extends EventEmitter {
         }
       }
     } else if (type === "compacting") {
+      appendHookEvent(sessionId, "compacting_end", { signal: "compacting.json" });
       this.compactingSignals.delete(sessionId);
       const session = this.sessions.get(sessionId);
       if (session) {

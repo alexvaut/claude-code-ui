@@ -63,7 +63,7 @@ pnpm setup          # install Claude hooks for session signals
 - `needs_approval` is internal; published as `waiting` with `hasPendingToolUse: true` — 5 public statuses
 - Permission debounce (3s) prevents false "Needs Approval" from auto-approved tools
 - Worktree sessions use `review` instead of `waiting`/`idle`; persistent git cache at `~/.claude/git-info-cache.json` survives worktree deletion
-- Transition logs written to `~/.claude/session-logs/`, served via HTTP on port 4451
+- Transition logs written to `~/.claude/session-logs/`, served via HTTP on port 4451; logs include both `[hook]` event lines (every hook signal) and state transition lines
 - AI summaries generated with `@anthropic-ai/sdk` (Claude Sonnet) in `src/summarizer.ts`
 - PR/CI status polled via `gh` CLI in `src/github.ts`
 - See `packages/daemon/HOOK-LIFECYCLE.md` for full hook event documentation
@@ -78,7 +78,7 @@ pnpm setup          # install Claude hooks for session signals
 | `packages/daemon/src/schema.ts` | Zod schemas + durable streams state schema |
 | `packages/daemon/src/server.ts` | Stream server publishing |
 | `packages/daemon/src/git.ts` | Git info resolution with worktree support |
-| `packages/daemon/src/transition-log.ts` | Per-session state transition logging |
+| `packages/daemon/src/transition-log.ts` | Per-session state transition + hook event logging |
 | `packages/daemon/src/log-server.ts` | HTTP server for transition logs (port 4451) |
 | `packages/daemon/HOOK-LIFECYCLE.md` | Empirical hook event documentation |
 | `packages/ui/src/main.tsx` | React entry point |
