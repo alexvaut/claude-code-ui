@@ -27,6 +27,8 @@ const toolIcons: Record<string, string> = {
   Bash: "▶️",
   Read: "📖",
   Grep: "🔍",
+  Glob: "📁",
+  Task: "🤖",
   MultiEdit: "✏️",
 };
 
@@ -170,6 +172,25 @@ export function SessionCard({ session, disableHover }: SessionCardProps) {
                     <Text size="1" color="gray">{task.description}</Text>
                   </Flex>
                 ))}
+              </Flex>
+            )}
+
+            {/* Active tools (when working, not pending approval) */}
+            {session.activeTools.length > 0 && !showPendingTool && (
+              <Flex direction="column" gap="1">
+                {session.activeTools.slice(0, 3).map((tool) => (
+                  <Flex key={tool.toolUseId} align="center" gap="2">
+                    <Text size="1" color="gray">
+                      {toolIcons[tool.toolName] || "🔧"}
+                    </Text>
+                    <Code size="1" variant="soft" color="grass">
+                      {tool.toolName}: {formatTarget(tool.target)}
+                    </Code>
+                  </Flex>
+                ))}
+                {session.activeTools.length > 3 && (
+                  <Text size="1" color="gray">+{session.activeTools.length - 3} more</Text>
+                )}
               </Flex>
             )}
 

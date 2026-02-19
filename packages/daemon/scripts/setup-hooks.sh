@@ -3,10 +3,27 @@
 # Installs hooks for accurate session state detection:
 # - UserPromptSubmit: detect when user starts a turn (working)
 # - PermissionRequest: detect when waiting for user approval
+# - PreToolUse (all): track active tools + subagent spawns
+# - PostToolUse (all): clear tool/permission signals on completion
+# - PostToolUseFailure (all): clear tool/permission signals on failure/denial
 # - Stop: detect when Claude finishes responding (waiting)
 # - SessionEnd: detect when session closes (idle)
+# - PreCompact: detect context compaction
 
 set -e
+
+# Parse options
+DEBUG_HOOKS=false
+for arg in "$@"; do
+  case "$arg" in
+    --debug) DEBUG_HOOKS=true ;;
+    --help|-h)
+      echo "Usage: setup-hooks.sh [--debug]"
+      echo "  --debug  Also install debug hooks that log all events to hook-debug.log"
+      exit 0
+      ;;
+  esac
+done
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
@@ -49,59 +66,87 @@ fi
 cp "$SETTINGS_FILE" "$SETTINGS_FILE.backup"
 echo "Backed up settings to $SETTINGS_FILE.backup"
 
-# Build the hooks configuration
-# UserPromptSubmit: write working signal when user starts turn
-USER_PROMPT_HOOK="$SCRIPT_DIR/hooks/user-prompt-submit.sh"
-# PermissionRequest: write pending permission file
-PERMISSION_HOOK="$SCRIPT_DIR/hooks/permission-request.sh"
-# Stop: write turn-ended signal
-STOP_HOOK="$SCRIPT_DIR/hooks/stop.sh"
-# SessionEnd: write session-ended signal
-SESSION_END_HOOK="$SCRIPT_DIR/hooks/session-end.sh"
-# PreToolUse (Task): write active agent signal when subagent spawns
-TASK_START_HOOK="$SCRIPT_DIR/hooks/task-start.sh"
-# PostToolUse (Task): remove agent signal when subagent completes
-TASK_END_HOOK="$SCRIPT_DIR/hooks/task-end.sh"
-# PreCompact: write compacting signal when context compaction starts
-COMPACT_START_HOOK="$SCRIPT_DIR/hooks/compact-start.sh"
-
-# Helper: upsert a hook entry — replaces existing entry with matching command prefix, or appends
+# Helper: upsert a hook entry — replaces existing entry with matching script name, or appends.
 # Usage: upsert_hook <hook_type> <matcher> <command>
-# This preserves existing hooks from other tools (e.g., Claude-Code-Remote)
+# Matches on the specific script filename (not directory), so multiple hooks of the same type
+# with different scripts can coexist (e.g., production + debug).
+# Preserves hooks from other tools (e.g., Claude-Code-Remote).
 upsert_hook() {
   local hook_type="$1" matcher="$2" command="$3"
   local entry="{\"matcher\": \"$matcher\", \"hooks\": [{\"type\": \"command\", \"command\": \"$command\"}]}"
-  # Use a relative marker for matching — MSYS on Windows converts /c/... to C:/... in --arg,
-  # breaking startswith. "packages/daemon/scripts/hooks/" is safe and unique.
-  local marker="packages/daemon/scripts/hooks/"
+  local script_name
+  script_name=$(basename "$command")
 
-  jq --arg type "$hook_type" --arg marker "$marker" --argjson entry "$entry" '
+  jq --arg type "$hook_type" --arg script_name "$script_name" --argjson entry "$entry" '
     .hooks[$type] //= [] |
-    # Remove any existing entry whose command contains our marker
-    .hooks[$type] = [.hooks[$type][] | select(.hooks[0].command | contains($marker) | not)] |
+    # Remove any existing entry whose command ends with our script name
+    .hooks[$type] = [.hooks[$type][] | select((.hooks[0].command | endswith($script_name)) | not)] |
     # Append our entry
     .hooks[$type] += [$entry]
   ' "$SETTINGS_FILE" > "$SETTINGS_FILE.tmp"
   mv "$SETTINGS_FILE.tmp" "$SETTINGS_FILE"
 }
 
-# Add all hooks (merges with existing — preserves hooks from other tools)
-upsert_hook "UserPromptSubmit" "" "$USER_PROMPT_HOOK"
-upsert_hook "PermissionRequest" "" "$PERMISSION_HOOK"
-upsert_hook "Stop" "" "$STOP_HOOK"
-upsert_hook "SessionEnd" "" "$SESSION_END_HOOK"
-upsert_hook "PreToolUse" "Task" "$TASK_START_HOOK"
-upsert_hook "PostToolUse" "Task" "$TASK_END_HOOK"
-upsert_hook "PreCompact" "" "$COMPACT_START_HOOK"
+# Helper: remove a hook entry by script name from a given hook type.
+# Usage: remove_hook <hook_type> <script_name>
+remove_hook() {
+  local hook_type="$1" script_name="$2"
 
-echo "Added hooks to $SETTINGS_FILE:"
+  jq --arg type "$hook_type" --arg script_name "$script_name" '
+    if .hooks[$type] then
+      .hooks[$type] = [.hooks[$type][] | select((.hooks[0].command | endswith($script_name)) | not)] |
+      # Clean up empty arrays
+      if .hooks[$type] == [] then del(.hooks[$type]) else . end
+    else . end
+  ' "$SETTINGS_FILE" > "$SETTINGS_FILE.tmp"
+  mv "$SETTINGS_FILE.tmp" "$SETTINGS_FILE"
+}
+
+# Production hooks
+upsert_hook "UserPromptSubmit" "" "$SCRIPT_DIR/hooks/user-prompt-submit.sh"
+upsert_hook "PermissionRequest" "" "$SCRIPT_DIR/hooks/permission-request.sh"
+upsert_hook "PreToolUse" "" "$SCRIPT_DIR/hooks/pre-tool-use-all.sh"
+upsert_hook "PostToolUse" "" "$SCRIPT_DIR/hooks/post-tool-use.sh"
+upsert_hook "PostToolUseFailure" "" "$SCRIPT_DIR/hooks/post-tool-use-failure.sh"
+upsert_hook "Stop" "" "$SCRIPT_DIR/hooks/stop.sh"
+upsert_hook "SessionEnd" "" "$SCRIPT_DIR/hooks/session-end.sh"
+upsert_hook "PreCompact" "" "$SCRIPT_DIR/hooks/compact-start.sh"
+
+# Debug hooks: install or remove based on --debug flag
+DEBUG_HOOK_SCRIPT="debug-hook.sh"
+DEBUG_HOOK_TYPES=(
+  "SessionStart" "UserPromptSubmit" "PreToolUse" "PermissionRequest"
+  "PostToolUse" "PostToolUseFailure" "Notification" "SubagentStart"
+  "SubagentStop" "Stop" "TeammateIdle" "TaskCompleted" "PreCompact"
+  "SessionEnd"
+)
+
+if [ "$DEBUG_HOOKS" = true ]; then
+  DEBUG_HOOK="$SCRIPT_DIR/hooks/$DEBUG_HOOK_SCRIPT"
+  for hook_type in "${DEBUG_HOOK_TYPES[@]}"; do
+    upsert_hook "$hook_type" "" "$DEBUG_HOOK"
+  done
+  echo "Installed debug hooks (logging all events to hook-debug.log)"
+else
+  # Remove any previously installed debug hooks
+  for hook_type in "${DEBUG_HOOK_TYPES[@]}"; do
+    remove_hook "$hook_type" "$DEBUG_HOOK_SCRIPT"
+  done
+fi
+
+echo ""
+echo "Installed hooks to $SETTINGS_FILE:"
 echo "  - UserPromptSubmit (detect turn started → working)"
 echo "  - PermissionRequest (detect approval needed)"
+echo "  - PreToolUse (track active tools + subagent spawns)"
+echo "  - PostToolUse (clear tool/permission on completion)"
+echo "  - PostToolUseFailure (clear tool/permission on failure/denial)"
 echo "  - Stop (detect turn ended → waiting)"
 echo "  - SessionEnd (detect session closed → idle)"
-echo "  - PreToolUse/Task (detect subagent spawned → tasking)"
-echo "  - PostToolUse/Task (detect subagent completed)"
 echo "  - PreCompact (detect context compaction)"
+if [ "$DEBUG_HOOKS" = true ]; then
+  echo "  - Debug: all 14 hook events logged to hook-debug.log"
+fi
 echo ""
 echo "Setup complete! The daemon will now accurately track session states."
 echo ""

@@ -64,6 +64,12 @@ export const SessionSchema = z.object({
     description: z.string(),
     startedAt: z.string(),
   })),
+  activeTools: z.array(z.object({
+    toolUseId: z.string(),
+    toolName: z.string(),
+    target: z.string(),
+    startedAt: z.string(),
+  })),
   todoProgress: z.object({
     total: z.number(),
     completed: z.number(),

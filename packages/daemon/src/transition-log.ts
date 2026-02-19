@@ -18,7 +18,7 @@ const initialized = new Set<string>();
 
 export interface TransitionMeta {
   event: string;
-  source: "hook" | "jsonl" | "stale-check" | "permission-removed" | "replay";
+  source: "hook" | "stale-check" | "replay";
   signal?: string;
   tool?: string;
   entryType?: string;

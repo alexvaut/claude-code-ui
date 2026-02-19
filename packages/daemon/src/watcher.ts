@@ -11,9 +11,8 @@ import {
 import { statusChanged } from "./status.js";
 import {
   transition,
-  logEntryToSessionEvent,
+  extractEntryMetadata,
   machineStateToPublishedStatus,
-  replayEntries,
   type SessionMachineState,
   type SessionEvent as MachineEvent,
 } from "./status-machine.js";
@@ -52,6 +51,21 @@ export interface ActiveTask {
   startedAt: string;
 }
 
+export interface ToolSignal {
+  session_id: string;
+  tool_use_id: string;
+  tool_name: string;
+  tool_input: Record<string, unknown>;
+  started_at: string;
+}
+
+export interface ActiveTool {
+  toolUseId: string;
+  toolName: string;
+  toolInput: Record<string, unknown>;
+  startedAt: string;
+}
+
 export interface TodoProgress {
   total: number;
   completed: number;
@@ -76,13 +90,14 @@ export interface SessionState {
   worktreePath: string | null; // The worktree checkout root directory
   // State machine
   machineState: SessionMachineState;
-  isHookDriven: boolean;       // True once first hook signal arrives (skip stale timeout)
   // Set when branch changed since last update
   branchChanged?: boolean;
   // Pending permission data (set when debounce fires, cleared on exit from needs_approval)
   pendingPermission?: PendingPermission;
   // Active subagents spawned via Task tool
   activeTasks: ActiveTask[];
+  // Active tools currently executing (from PreToolUse/PostToolUse hooks)
+  activeTools: ActiveTool[];
   // Todo progress from TodoWrite
   todoProgress: TodoProgress | null;
 }
@@ -98,6 +113,7 @@ export class SessionWatcher extends EventEmitter {
   private signalWatcher: FSWatcher | null = null;
   private sessions = new Map<string, SessionState>();
   private taskSignals = new Map<string, Map<string, ActiveTask>>(); // sessionId → toolUseId → ActiveTask
+  private toolSignals = new Map<string, Map<string, ActiveTool>>(); // sessionId → toolUseId → ActiveTool
   private compactingSignals = new Map<string, string>(); // sessionId → startedAt
   private debounceTimers = new Map<string, NodeJS.Timeout>();
   private permissionTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -253,11 +269,16 @@ export class SessionWatcher extends EventEmitter {
    * Parse signal filename to extract session ID and signal type.
    * Formats:
    *   <session_id>.<type>.json (e.g., abc123.permission.json)
+   *   <session_id>.tool.<tool_use_id>.json (e.g., abc123.tool.toolu_xyz.json)
    *   <session_id>.task.<tool_use_id>.json (e.g., abc123.task.toolu_xyz.json)
    *   <session_id>.compacting.json
    */
-  private parseSignalFilename(filepath: string): { sessionId: string; type: "working" | "permission" | "stop" | "ended" | "task" | "compacting"; toolUseId?: string } | null {
+  private parseSignalFilename(filepath: string): { sessionId: string; type: "working" | "permission" | "stop" | "ended" | "tool" | "task" | "compacting"; toolUseId?: string } | null {
     const filename = filepath.replace(/\\/g, "/").split("/").pop() || "";
+
+    // Match tool signals: <session_id>.tool.<tool_use_id>.json
+    const toolMatch = filename.match(/^(.+)\.tool\.(.+)\.json$/);
+    if (toolMatch) return { sessionId: toolMatch[1], type: "tool", toolUseId: toolMatch[2] };
 
     // Match task signals: <session_id>.task.<tool_use_id>.json
     const taskMatch = filename.match(/^(.+)\.task\.(.+)\.json$/);
@@ -288,15 +309,10 @@ export class SessionWatcher extends EventEmitter {
 
       if (type === "working") {
         log("Watcher", `Working signal for session ${sessionId}`);
-        const session = this.sessions.get(sessionId);
-        if (session) session.isHookDriven = true;
         this.transitionSession(sessionId, { type: "WORKING" }, { event: "WORKING", source: "hook", signal: "working.json" });
       } else if (type === "permission") {
         const permission = data as PendingPermission;
         log("Watcher", `Pending permission for session ${sessionId}: ${permission.tool_name}`);
-
-        const session = this.sessions.get(sessionId);
-        if (session) session.isHookDriven = true;
 
         // Cancel any existing debounce timer
         const existingTimer = this.permissionTimers.get(sessionId);
@@ -313,14 +329,34 @@ export class SessionWatcher extends EventEmitter {
         }, this.permissionDelayMs));
       } else if (type === "stop") {
         log("Watcher", `Stop signal for session ${sessionId}`);
-        const session = this.sessions.get(sessionId);
-        if (session) session.isHookDriven = true;
         this.transitionSession(sessionId, { type: "STOP" }, { event: "STOP", source: "hook", signal: "stop.json" });
       } else if (type === "ended") {
         log("Watcher", `Session ended signal for ${sessionId}`);
-        const session = this.sessions.get(sessionId);
-        if (session) session.isHookDriven = true;
         this.transitionSession(sessionId, { type: "ENDED" }, { event: "ENDED", source: "hook", signal: "ended.json" });
+      } else if (type === "tool" && parsed.toolUseId) {
+        const toolSignal = data as ToolSignal;
+        log("Watcher", `Tool signal for session ${sessionId}: ${toolSignal.tool_name} (${parsed.toolUseId})`);
+
+        // Store in tool signals map
+        let sessionTools = this.toolSignals.get(sessionId);
+        if (!sessionTools) {
+          sessionTools = new Map();
+          this.toolSignals.set(sessionId, sessionTools);
+        }
+        const activeTool: ActiveTool = {
+          toolUseId: parsed.toolUseId,
+          toolName: toolSignal.tool_name || "unknown",
+          toolInput: toolSignal.tool_input || {},
+          startedAt: toolSignal.started_at || new Date().toISOString(),
+        };
+        sessionTools.set(parsed.toolUseId, activeTool);
+
+        // Update session so UI can show active tools
+        const session = this.sessions.get(sessionId);
+        if (session) {
+          session.activeTools = this.getActiveToolsForSession(sessionId);
+          this.emit("session", { type: "updated", session } satisfies SessionEvent);
+        }
       } else if (type === "task" && parsed.toolUseId) {
         const taskSignal = data as TaskSignal;
         log("Watcher", `Task signal for session ${sessionId}: ${taskSignal.agent_type || "unknown"} - ${taskSignal.description || ""}`);
@@ -393,6 +429,14 @@ export class SessionWatcher extends EventEmitter {
   }
 
   /**
+   * Build the activeTools array for a session from tool signals.
+   */
+  private getActiveToolsForSession(sessionId: string): ActiveTool[] {
+    const tools = this.toolSignals.get(sessionId);
+    return tools ? Array.from(tools.values()) : [];
+  }
+
+  /**
    * Handle a signal file being removed.
    */
   private handleSignalRemoved(filepath: string): void {
@@ -407,25 +451,25 @@ export class SessionWatcher extends EventEmitter {
       const timer = this.permissionTimers.get(sessionId);
       if (timer) { clearTimeout(timer); this.permissionTimers.delete(sessionId); }
 
-      // If debounce already fired (machine is in needs_approval), fall back to JSONL-derived state
+      // If debounce already fired (machine is in needs_approval), transition back to working.
+      // PostToolUse/PostToolUseFailure hook deleted permission.json → tool completed.
       const session = this.sessions.get(sessionId);
       if (session?.machineState === "needs_approval") {
-        session.pendingPermission = undefined;
-        const { state } = replayEntries(session.entries, session.isWorktree);
-        const nextState = state;
-        if (nextState !== session.machineState) {
-          appendTransition(sessionId, session.machineState, nextState, { event: "REPLAY", source: "permission-removed" });
-          session.machineState = nextState;
-          const previousStatus = session.status;
-          const published = machineStateToPublishedStatus(nextState);
-          session.status = { ...session.status, status: published.status, hasPendingToolUse: published.hasPendingToolUse };
-          this.emit("session", { type: "updated", session, previousStatus } satisfies SessionEvent);
-
-          // Auto-escalate to tasking if active tasks exist after permission resolved
-          if (nextState === "working" && session.activeTasks.length > 0) {
-            this.transitionSession(sessionId, { type: "TASK_STARTED" }, { event: "TASK_STARTED", source: "permission-removed", signal: "auto-escalate" });
-          }
+        this.transitionSession(sessionId, { type: "WORKING" },
+          { event: "WORKING", source: "hook", signal: "permission.json removed" });
+      }
+    } else if (type === "tool" && parsed.toolUseId) {
+      const sessionTools = this.toolSignals.get(sessionId);
+      if (sessionTools) {
+        sessionTools.delete(parsed.toolUseId);
+        if (sessionTools.size === 0) {
+          this.toolSignals.delete(sessionId);
         }
+      }
+      const session = this.sessions.get(sessionId);
+      if (session) {
+        session.activeTools = this.getActiveToolsForSession(sessionId);
+        this.emit("session", { type: "updated", session } satisfies SessionEvent);
       }
     } else if (type === "task" && parsed.toolUseId) {
       const sessionTasks = this.taskSignals.get(sessionId);
@@ -504,12 +548,13 @@ export class SessionWatcher extends EventEmitter {
    */
   private async checkStaleSessions(): Promise<void> {
     for (const session of this.sessions.values()) {
-      // Stale timeout: working sessions without hook signals get STOP after 15s inactivity.
-      // Note: "tasking" is deliberately excluded — subagents run independently,
-      // so the primary session being silent is expected.
-      if (session.machineState === "working" && !session.isHookDriven) {
+      // Safety-net stale timeout: working sessions get STOP after 60s inactivity.
+      // Hooks should handle this via the Stop event, but this catches edge cases
+      // where hooks fail to fire. "tasking" is deliberately excluded — subagents
+      // run independently, so the primary session being silent is expected.
+      if (session.machineState === "working") {
         const elapsed = Date.now() - new Date(session.status.lastActivityAt).getTime();
-        if (elapsed > 15_000) {
+        if (elapsed > 60_000) {
           this.transitionSession(session.sessionId, { type: "STOP" }, { event: "STOP", source: "stale-check", elapsed });
         }
       }
@@ -543,54 +588,25 @@ export class SessionWatcher extends EventEmitter {
   }
 
   /**
-   * Extract active tasks and todo progress from JSONL entries.
-   * Used as fallback when hook signals are not available.
+   * Extract todo progress from JSONL entries.
    */
-  private extractSessionInfo(entries: LogEntry[]): {
-    activeTasks: ActiveTask[];
-    todoProgress: TodoProgress | null;
-  } {
-    const pendingTaskIds = new Map<string, ActiveTask>();
+  private extractTodoProgress(entries: LogEntry[]): TodoProgress | null {
     let latestTodos: Array<{ content: string; status: string }> | null = null;
 
     for (const entry of entries) {
-      if (entry.type === "assistant") {
-        for (const block of entry.message.content) {
-          if (block.type === "tool_use" && block.name === "Task") {
-            const input = block.input as Record<string, unknown>;
-            pendingTaskIds.set(block.id, {
-              toolUseId: block.id,
-              agentType: (input.subagent_type as string) || "unknown",
-              description: (input.description as string) || "task",
-              startedAt: entry.timestamp,
-            });
-          }
-        }
-      } else if (entry.type === "user") {
-        // Check for tool_results that resolve Task calls
-        if (Array.isArray(entry.message.content)) {
-          for (const block of entry.message.content) {
-            if (block.type === "tool_result") {
-              pendingTaskIds.delete(block.tool_use_id);
-            }
-          }
-        }
-        // Check for todos
+      if (entry.type === "user") {
         if (entry.todos && entry.todos.length > 0) {
           latestTodos = entry.todos;
         }
       }
     }
 
-    return {
-      activeTasks: Array.from(pendingTaskIds.values()),
-      todoProgress: latestTodos
-        ? {
-            total: latestTodos.length,
-            completed: latestTodos.filter((t) => t.status === "completed").length,
-          }
-        : null,
-    };
+    return latestTodos
+      ? {
+          total: latestTodos.length,
+          completed: latestTodos.filter((t) => t.status === "completed").length,
+        }
+      : null;
   }
 
   private async handleFile(
@@ -663,16 +679,13 @@ export class SessionWatcher extends EventEmitter {
         }
       }
 
-      // Derive status from all JSONL entries via the state machine replay
-      const { state: replayedState, lastActivityAt, messageCount } = replayEntries(allEntries, gitInfo.isWorktree);
-      const published = machineStateToPublishedStatus(replayedState);
+      // Extract metadata from JSONL entries (content only, no state derivation)
+      const { lastActivityAt, messageCount } = extractEntryMetadata(allEntries);
 
-      // For existing sessions, use current machine state (hook-driven transitions
-      // are already applied). For new sessions, use the JSONL-replayed state.
-      const machineState = existingSession ? existingSession.machineState : replayedState;
-      const machinePublished = existingSession
-        ? machineStateToPublishedStatus(machineState)
-        : published;
+      // For existing sessions, preserve current machine state (driven by hooks).
+      // For new sessions, default to "waiting" — hook signals will correct this.
+      const machineState = existingSession ? existingSession.machineState : "waiting" as SessionMachineState;
+      const machinePublished = machineStateToPublishedStatus(machineState);
 
       const status: StatusResult = {
         status: machinePublished.status,
@@ -683,38 +696,13 @@ export class SessionWatcher extends EventEmitter {
       };
       const previousStatus = existingSession?.status;
 
-      // Extract active tasks and todo progress from entries (JSONL fallback)
-      const sessionInfo = this.extractSessionInfo(allEntries);
+      // Extract todo progress from entries
+      const todoProgress = this.extractTodoProgress(allEntries);
 
       // If compacting signal exists and new entries arrived, compaction is done
       if (newEntries.length > 0 && this.compactingSignals.has(sessionId)) {
         this.compactingSignals.delete(sessionId);
         this.cleanupSignalFile(sessionId, "compacting");
-      }
-
-      // Process new entries through machine for existing sessions
-      // (drives transitions from JSONL when hooks are not present)
-      if (existingSession && !existingSession.isHookDriven) {
-        let currentState = existingSession.machineState;
-        for (const entry of newEntries) {
-          const event = logEntryToSessionEvent(entry);
-          if (event) {
-            const prevState = currentState;
-            currentState = transition(currentState, event, gitInfo.isWorktree);
-            if (currentState !== prevState) {
-              const entryType = entry.type === "system"
-                ? `system/${(entry as { subtype?: string }).subtype ?? "unknown"}`
-                : entry.type;
-              appendTransition(sessionId, prevState, currentState, { event: event.type, source: "jsonl", entryType });
-            }
-          }
-        }
-        if (currentState !== existingSession.machineState) {
-          existingSession.machineState = currentState;
-          const newPublished = machineStateToPublishedStatus(currentState);
-          status.status = newPublished.status;
-          status.hasPendingToolUse = newPublished.hasPendingToolUse;
-        }
       }
 
       // Build session state - prefer branch from git info over log entry
@@ -735,17 +723,12 @@ export class SessionWatcher extends EventEmitter {
         isWorktree: gitInfo.isWorktree,
         worktreePath: gitInfo.worktreePath,
         branchChanged,
-        machineState: existingSession ? existingSession.machineState : replayedState,
-        isHookDriven: existingSession?.isHookDriven ?? false,
+        machineState,
         pendingPermission: existingSession?.pendingPermission,
-        // Hook signals are authoritative for active tasks.
-        // JSONL fallback only reports tasks when session is working/tasking — if the turn
-        // ended (waiting/idle), all tasks completed even if tool_result matching
-        // failed (e.g., due to context compaction rewriting entries).
-        activeTasks: this.taskSignals.has(sessionId) || this.compactingSignals.has(sessionId)
-          ? this.getActiveTasksForSession(sessionId)
-          : (status.status === "working" || status.status === "tasking") ? sessionInfo.activeTasks : [],
-        todoProgress: sessionInfo.todoProgress,
+        // Hook signals are authoritative for active tasks and tools
+        activeTasks: this.getActiveTasksForSession(sessionId),
+        activeTools: this.getActiveToolsForSession(sessionId),
+        todoProgress,
       };
 
       // Store session
@@ -757,15 +740,16 @@ export class SessionWatcher extends EventEmitter {
       const hasNewMessages = existingSession && status.messageCount > existingSession.status.messageCount;
       const infoChanged = existingSession && (
         existingSession.activeTasks.length !== session.activeTasks.length ||
+        existingSession.activeTools.length !== session.activeTools.length ||
         existingSession.todoProgress?.completed !== session.todoProgress?.completed ||
         existingSession.todoProgress?.total !== session.todoProgress?.total
       );
 
       // Reconcile tasking state with active tasks (handles both new and existing sessions)
       if (session.machineState === "working" && session.activeTasks.length > 0) {
-        this.transitionSession(sessionId, { type: "TASK_STARTED" }, { event: "TASK_STARTED", source: session.isHookDriven ? "hook" : "jsonl", signal: "reconcile" });
+        this.transitionSession(sessionId, { type: "TASK_STARTED" }, { event: "TASK_STARTED", source: "hook", signal: "reconcile" });
       } else if (session.machineState === "tasking" && session.activeTasks.length === 0) {
-        this.transitionSession(sessionId, { type: "TASKS_DONE" }, { event: "TASKS_DONE", source: session.isHookDriven ? "hook" : "jsonl", signal: "reconcile" });
+        this.transitionSession(sessionId, { type: "TASKS_DONE" }, { event: "TASKS_DONE", source: "hook", signal: "reconcile" });
       }
 
       if (isNew) {

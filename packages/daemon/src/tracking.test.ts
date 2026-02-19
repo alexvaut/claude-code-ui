@@ -10,16 +10,9 @@ import path from "node:path";
 import os from "node:os";
 import { execFileSync } from "node:child_process";
 import { SessionWatcher } from "./watcher.js";
-import { deriveStatus } from "./status.js";
 import { tailJSONL, extractMetadata } from "./parser.js";
-import {
-  transition,
-  logEntryToSessionEvent,
-  replayEntries,
-  type SessionMachineState,
-} from "./status-machine.js";
+import { transition } from "./status-machine.js";
 import { getGitInfo, getGitInfoCached, _resetGitCaches } from "./git.js";
-import type { LogEntry } from "./types.js";
 
 const TEST_DIR = path.join(os.homedir(), ".claude", "projects", "-test-e2e-session");
 const SIGNALS_DIR = path.join(os.homedir(), ".claude", "session-signals");
@@ -158,72 +151,6 @@ describe("Session Tracking", () => {
       expect(second[0].type).toBe("assistant");
       expect(second[1].type).toBe("user");
       expect(pos2).toBeGreaterThan(pos1);
-    });
-  });
-
-  describe("Status Derivation", () => {
-    it("should detect working status after user message", async () => {
-      const entry = createUserEntry("Do something");
-      await writeFile(TEST_LOG_FILE, entry);
-
-      const { entries } = await tailJSONL(TEST_LOG_FILE, 0);
-      const status = deriveStatus(entries);
-
-      expect(status.status).toBe("working");
-      // Note: lastRole is not tracked in current implementation
-      expect(status.hasPendingToolUse).toBe(false);
-    });
-
-    it("should detect waiting status after assistant response with turn end", async () => {
-      const timestamp = new Date().toISOString();
-      const entry1 = createUserEntry("Do something", timestamp);
-      const entry2 = createAssistantEntry("Done!", timestamp);
-      // Add a turn_duration system event to signal turn completion
-      const turnEndEntry = JSON.stringify({
-        type: "system",
-        subtype: "turn_duration",
-        timestamp,
-        duration_ms: 1000,
-        duration_api_ms: 900,
-      }) + "\n";
-      await writeFile(TEST_LOG_FILE, entry1 + entry2 + turnEndEntry);
-
-      const { entries } = await tailJSONL(TEST_LOG_FILE, 0);
-      const status = deriveStatus(entries);
-
-      expect(status.status).toBe("waiting");
-      // Note: lastRole is not tracked in current implementation
-      expect(status.hasPendingToolUse).toBe(false);
-    });
-
-    it("should detect tool use as working (JSONL can't distinguish approval state)", async () => {
-      const entry1 = createUserEntry("Run a command");
-      const entry2 = createAssistantEntry("I'll run that for you", new Date().toISOString(), true);
-      await writeFile(TEST_LOG_FILE, entry1 + entry2);
-
-      const { entries } = await tailJSONL(TEST_LOG_FILE, 0);
-      const status = deriveStatus(entries);
-
-      // From JSONL alone we can't distinguish "waiting for approval" from
-      // "auto-approved and executing" — treat all tool_use as WORKING.
-      // PERMISSION_REQUEST only comes from the PermissionRequest hook.
-      expect(status.status).toBe("working");
-      expect(status.hasPendingToolUse).toBe(false);
-    });
-
-    it("should report waiting status for old sessions (idle determined by UI)", async () => {
-      // Create entry from 10 minutes ago
-      // Note: idle status is now determined by the UI based on elapsed time
-      const oldTime = new Date(Date.now() - 10 * 60 * 1000).toISOString();
-      const entry = createAssistantEntry("Old response", oldTime);
-      await writeFile(TEST_LOG_FILE, entry);
-
-      const { entries } = await tailJSONL(TEST_LOG_FILE, 0);
-      const status = deriveStatus(entries);
-
-      // Daemon reports "waiting" - UI will show as "idle" based on elapsed time
-      expect(status.status).toBe("waiting");
-      expect(status.lastActivityAt).toBe(oldTime);
     });
   });
 
@@ -539,185 +466,6 @@ describe("Session Tracking", () => {
     });
   });
 
-  describe("JSONL Event Mapping", () => {
-    it("user prompt (string) → WORKING", () => {
-      const entry = JSON.parse(createUserEntry("hello").trim());
-      expect(logEntryToSessionEvent(entry)).toEqual({ type: "WORKING" });
-    });
-
-    it("user prompt (array with text block) → WORKING", () => {
-      const entry = {
-        type: "user" as const,
-        message: { role: "user" as const, content: [{ type: "text", text: "hello" }] },
-      };
-      expect(logEntryToSessionEvent(entry as LogEntry)).toEqual({ type: "WORKING" });
-    });
-
-    it("tool_result → WORKING", () => {
-      const entry = {
-        type: "user" as const,
-        message: { role: "user" as const, content: [{ type: "tool_result", tool_use_id: "t1", content: "ok" }] },
-      };
-      expect(logEntryToSessionEvent(entry as LogEntry)).toEqual({ type: "WORKING" });
-    });
-
-    it("assistant with Bash tool_use → WORKING (JSONL can't distinguish approval)", () => {
-      const entry = JSON.parse(createAssistantEntry("running", new Date().toISOString(), true).trim());
-      expect(logEntryToSessionEvent(entry)).toEqual({ type: "WORKING" });
-    });
-
-    it("assistant with Read tool_use → WORKING", () => {
-      const entry = {
-        type: "assistant" as const,
-        message: {
-          role: "assistant" as const,
-          content: [{ type: "tool_use", id: "t1", name: "Read", input: { file_path: "/a" } }],
-        },
-      };
-      expect(logEntryToSessionEvent(entry as unknown as LogEntry)).toEqual({ type: "WORKING" });
-    });
-
-    it("assistant with Task tool_use → WORKING", () => {
-      const entry = {
-        type: "assistant" as const,
-        message: {
-          role: "assistant" as const,
-          content: [{ type: "tool_use", id: "t1", name: "Task", input: {} }],
-        },
-      };
-      expect(logEntryToSessionEvent(entry as unknown as LogEntry)).toEqual({ type: "WORKING" });
-    });
-
-    it("assistant text only → null (no state change)", () => {
-      const entry = JSON.parse(createAssistantEntry("just text").trim());
-      expect(logEntryToSessionEvent(entry)).toBeNull();
-    });
-
-    it("system turn_duration → STOP", () => {
-      const entry = { type: "system" as const, subtype: "turn_duration", duration_ms: 1000 };
-      expect(logEntryToSessionEvent(entry as unknown as LogEntry)).toEqual({ type: "STOP" });
-    });
-
-    it("system stop_hook_summary → STOP", () => {
-      const entry = { type: "system" as const, subtype: "stop_hook_summary" };
-      expect(logEntryToSessionEvent(entry as unknown as LogEntry)).toEqual({ type: "STOP" });
-    });
-  });
-
-  describe("Session Replay Scenarios", () => {
-    function makeUser(content: string, timestamp = new Date().toISOString()) {
-      return JSON.parse(createUserEntry(content, timestamp).trim()) as LogEntry;
-    }
-    function makeAssistant(content: string, timestamp = new Date().toISOString(), hasToolUse = false) {
-      return JSON.parse(createAssistantEntry(content, timestamp, hasToolUse).trim()) as LogEntry;
-    }
-    function makeTurnEnd(timestamp = new Date().toISOString()): LogEntry {
-      return { type: "system", subtype: "turn_duration", timestamp, duration_ms: 1000, duration_api_ms: 900 } as unknown as LogEntry;
-    }
-    function makeToolResult(toolUseId: string, timestamp = new Date().toISOString()): LogEntry {
-      return {
-        type: "user",
-        timestamp,
-        message: { role: "user", content: [{ type: "tool_result", tool_use_id: toolUseId, content: "ok" }] },
-      } as unknown as LogEntry;
-    }
-
-    it("simple Q&A: user → assistant → turn_end → waiting", () => {
-      const now = new Date().toISOString();
-      const entries = [makeUser("help", now), makeAssistant("sure", now), makeTurnEnd(now)];
-      const { state } = replayEntries(entries, false);
-      expect(state).toBe("waiting");
-    });
-
-    it("tool approval flow: user → assistant+Bash → tool_result → assistant → turn_end → waiting", () => {
-      const now = new Date().toISOString();
-      const assistantWithTool = makeAssistant("running", now, true);
-      // Extract the tool_use id
-      const toolId = ((assistantWithTool as unknown as { message: { content: Array<{ type: string; id?: string }> } }).message.content.find(
-        (b) => b.type === "tool_use"
-      ))!.id!;
-      const entries = [
-        makeUser("run it", now),
-        assistantWithTool,
-        makeToolResult(toolId, now),
-        makeAssistant("done", now),
-        makeTurnEnd(now),
-      ];
-      const { state } = replayEntries(entries, false);
-      expect(state).toBe("waiting");
-    });
-
-    it("any tool_use in JSONL → working (JSONL can't detect approval state)", () => {
-      const now = new Date().toISOString();
-      // Build an assistant entry with a Read tool
-      const entry: LogEntry = {
-        type: "assistant",
-        timestamp: now,
-        message: {
-          role: "assistant",
-          content: [
-            { type: "text", text: "reading file" },
-            { type: "tool_use", id: "t1", name: "Read", input: { file_path: "/a" } },
-          ],
-        },
-      } as unknown as LogEntry;
-      const entries = [makeUser("read", now), entry];
-      const { state } = replayEntries(entries, false);
-      expect(state).toBe("working");
-    });
-
-    it("pending Bash tool at end of log → working (needs_approval only from hooks)", () => {
-      const now = new Date().toISOString();
-      const entries = [makeUser("run", now), makeAssistant("running", now, true)];
-      const { state } = replayEntries(entries, false);
-      expect(state).toBe("working");
-    });
-
-    it("worktree: turn_end → review instead of waiting", () => {
-      const now = new Date().toISOString();
-      const entries = [makeUser("help", now), makeAssistant("done", now), makeTurnEnd(now)];
-      const { state } = replayEntries(entries, true);
-      expect(state).toBe("review");
-    });
-
-    it("stale working session → waiting (STALE_TIMEOUT applied)", () => {
-      const oldTime = new Date(Date.now() - 30_000).toISOString(); // 30s ago, well past 15s timeout
-      const entries = [makeUser("help", oldTime)];
-      const { state } = replayEntries(entries, false);
-      expect(state).toBe("waiting");
-    });
-
-    it("tracks messageCount across entries", () => {
-      const now = new Date().toISOString();
-      const entries = [
-        makeUser("one", now),
-        makeAssistant("two", now, true), // tool use counts
-        makeUser("three", now),
-      ];
-      const { messageCount } = replayEntries(entries, false);
-      expect(messageCount).toBe(3); // 2 user prompts + 1 assistant with tool_use
-    });
-
-    it("tracks lastActivityAt from most recent entry", () => {
-      const t1 = "2025-01-01T00:00:00Z";
-      const t2 = "2025-01-01T01:00:00Z";
-      const entries = [makeUser("one", t1), makeAssistant("two", t2)];
-      const { lastActivityAt } = replayEntries(entries, false);
-      expect(lastActivityAt).toBe(t2);
-    });
-
-    it("multi-turn: two full Q&A exchanges → waiting", () => {
-      const now = new Date().toISOString();
-      const entries = [
-        makeUser("q1", now), makeAssistant("a1", now), makeTurnEnd(now),
-        makeUser("q2", now), makeAssistant("a2", now), makeTurnEnd(now),
-      ];
-      const { state, messageCount } = replayEntries(entries, false);
-      expect(state).toBe("waiting");
-      expect(messageCount).toBe(2); // 2 user prompts
-    });
-  });
-
   describe("Signal Integration", () => {
     let signalFile: (type: string, data: Record<string, unknown>) => string;
     let cleanupFiles: string[];
@@ -840,12 +588,19 @@ describe("Session Tracking", () => {
 
       await watcher.start();
 
-      // 1. Create session → working
+      // 1. Create session (initial state: waiting)
       await writeFile(TEST_LOG_FILE, createUserEntry("initial task"));
       await new Promise((r) => setTimeout(r, 1000));
+
+      // 2. Working signal → working (hooks are the only source of state transitions)
+      await writeFile(signalFile("working", {}), JSON.stringify({
+        session_id: TEST_SESSION_ID,
+        working_since: new Date().toISOString(),
+      }));
+      await new Promise((r) => setTimeout(r, 500));
       expect(statuses).toContain("working");
 
-      // 2. Stop signal → waiting (non-worktree in test, but behavior is the same concern)
+      // 3. Stop signal → waiting
       await writeFile(signalFile("stop", {}), JSON.stringify({
         session_id: TEST_SESSION_ID,
         stopped_at: new Date().toISOString(),
@@ -853,7 +608,7 @@ describe("Session Tracking", () => {
       await new Promise((r) => setTimeout(r, 500));
       expect(statuses).toContain("waiting");
 
-      // 3. Working signal → working (this is the fix — should NOT stay stuck)
+      // 4. Working signal again → working (this is the fix — should NOT stay stuck)
       await writeFile(signalFile("working", {}), JSON.stringify({
         session_id: TEST_SESSION_ID,
         working_since: new Date().toISOString(),
@@ -867,7 +622,7 @@ describe("Session Tracking", () => {
       expect(statuses[statuses.length - 1]).toBe("working");
     });
 
-    it("JSONL-only flow (no hook signals): status derived from entries", async () => {
+    it("JSONL changes do not cause state transitions", async () => {
       const watcher = new SessionWatcher({ debounceMs: 50, permissionDelayMs: 1000 });
       const statuses: Array<{ status: string; hasPendingToolUse: boolean }> = [];
       watcher.on("session", (event) => {
@@ -881,19 +636,22 @@ describe("Session Tracking", () => {
 
       await watcher.start();
 
-      // 1. User prompt → working
+      // 1. Create session (initial state: waiting)
       await writeFile(TEST_LOG_FILE, createUserEntry("help"));
       await new Promise((r) => setTimeout(r, 1000));
-      expect(statuses[0]?.status).toBe("working");
 
-      // 2. Assistant with Bash tool → still working (JSONL can't detect approval)
+      // 2. Hook-driven: working signal → working
+      await writeFile(signalFile("working", {}), JSON.stringify({
+        session_id: TEST_SESSION_ID,
+        working_since: new Date().toISOString(),
+      }));
+      await new Promise((r) => setTimeout(r, 500));
+      expect(statuses[statuses.length - 1].status).toBe("working");
+
+      // 3. Append JSONL entries (assistant with tool_use, turn end) — should NOT change state
       await appendFile(TEST_LOG_FILE, createAssistantEntry("running", new Date().toISOString(), true));
       await new Promise((r) => setTimeout(r, 500));
-      const afterTool = statuses[statuses.length - 1];
-      expect(afterTool.status).toBe("working");
-      expect(afterTool.hasPendingToolUse).toBe(false);
 
-      // 3. Turn end → waiting
       const turnEnd = JSON.stringify({
         type: "system",
         subtype: "turn_duration",
@@ -907,9 +665,8 @@ describe("Session Tracking", () => {
       watcher.stop();
       await new Promise((r) => setTimeout(r, 100));
 
-      const final = statuses[statuses.length - 1];
-      expect(final.status).toBe("waiting");
-      expect(final.hasPendingToolUse).toBe(false);
+      // State should still be "working" — JSONL entries don't drive state transitions
+      expect(statuses[statuses.length - 1].status).toBe("working");
     });
 
     it("task signal lifecycle: working → tasking → working", async () => {
@@ -923,9 +680,14 @@ describe("Session Tracking", () => {
 
       await watcher.start();
 
-      // 1. Create session → working
+      // 1. Create session (initial state: waiting), then working signal → working
       await writeFile(TEST_LOG_FILE, createUserEntry("do some tasks"));
       await new Promise((r) => setTimeout(r, 1000));
+      await writeFile(signalFile("working", {}), JSON.stringify({
+        session_id: TEST_SESSION_ID,
+        working_since: new Date().toISOString(),
+      }));
+      await new Promise((r) => setTimeout(r, 500));
       expect(statuses).toContain("working");
 
       // 2. Task signal → tasking
@@ -972,6 +734,170 @@ describe("Session Tracking", () => {
       await new Promise((r) => setTimeout(r, 100));
 
       expect(statuses[statuses.length - 1]).toBe("waiting");
+    });
+
+    it("PostToolUse clears permission — needs_approval → working", async () => {
+      const watcher = new SessionWatcher({ debounceMs: 50, permissionDelayMs: 500 });
+      const statuses: Array<{ status: string; hasPendingToolUse: boolean }> = [];
+      watcher.on("session", (event) => {
+        if (event.session.sessionId === TEST_SESSION_ID) {
+          statuses.push({
+            status: event.session.status.status,
+            hasPendingToolUse: event.session.status.hasPendingToolUse,
+          });
+        }
+      });
+
+      await watcher.start();
+
+      // 1. Create session → working
+      await writeFile(TEST_LOG_FILE, createUserEntry("run something"));
+      await new Promise((r) => setTimeout(r, 1000));
+
+      // 2. Working signal to ensure we're in working state
+      await writeFile(signalFile("working", {}), JSON.stringify({
+        session_id: TEST_SESSION_ID,
+        working_since: new Date().toISOString(),
+      }));
+      await new Promise((r) => setTimeout(r, 300));
+
+      // 3. Permission signal → needs_approval (after debounce)
+      const permFile = signalFile("permission", {});
+      await writeFile(permFile, JSON.stringify({
+        session_id: TEST_SESSION_ID,
+        tool_name: "Bash",
+        tool_input: { command: "rm -rf /" },
+        pending_since: new Date().toISOString(),
+      }));
+      await new Promise((r) => setTimeout(r, 800)); // past debounce
+
+      const afterPermission = statuses[statuses.length - 1];
+      expect(afterPermission.status).toBe("waiting");
+      expect(afterPermission.hasPendingToolUse).toBe(true);
+
+      // 4. Delete permission.json (simulates PostToolUse hook) → back to working
+      await rm(permFile, { force: true });
+      await new Promise((r) => setTimeout(r, 500));
+
+      watcher.stop();
+      await new Promise((r) => setTimeout(r, 100));
+
+      const final = statuses[statuses.length - 1];
+      expect(final.status).toBe("working");
+      expect(final.hasPendingToolUse).toBe(false);
+    });
+
+    it("tool signal lifecycle — activeTools populated and cleared", async () => {
+      const watcher = new SessionWatcher({ debounceMs: 50, permissionDelayMs: 1000 });
+      const events: Array<{ activeTools: Array<{ toolUseId: string; toolName: string }> }> = [];
+      watcher.on("session", (event) => {
+        if (event.session.sessionId === TEST_SESSION_ID) {
+          events.push({
+            activeTools: event.session.activeTools.map((t: { toolUseId: string; toolName: string }) => ({
+              toolUseId: t.toolUseId,
+              toolName: t.toolName,
+            })),
+          });
+        }
+      });
+
+      await watcher.start();
+
+      // 1. Create session
+      await writeFile(TEST_LOG_FILE, createUserEntry("do something"));
+      await new Promise((r) => setTimeout(r, 1000));
+
+      // 2. Write tool signal
+      const toolFile = signalFile("tool.toolu_read_01", {});
+      await writeFile(toolFile, JSON.stringify({
+        session_id: TEST_SESSION_ID,
+        tool_use_id: "toolu_read_01",
+        tool_name: "Read",
+        tool_input: { file_path: "/some/file.ts" },
+        started_at: new Date().toISOString(),
+      }));
+      await new Promise((r) => setTimeout(r, 500));
+
+      // Should have activeTools with our tool
+      const withTool = events[events.length - 1];
+      expect(withTool.activeTools).toContainEqual({
+        toolUseId: "toolu_read_01",
+        toolName: "Read",
+      });
+
+      // 3. Remove tool signal (simulates PostToolUse)
+      await rm(toolFile, { force: true });
+      await new Promise((r) => setTimeout(r, 500));
+
+      watcher.stop();
+      await new Promise((r) => setTimeout(r, 100));
+
+      // activeTools should be empty
+      const afterRemoval = events[events.length - 1];
+      expect(afterRemoval.activeTools).toHaveLength(0);
+    });
+
+    it("multiple concurrent tool signals", async () => {
+      const watcher = new SessionWatcher({ debounceMs: 50, permissionDelayMs: 1000 });
+      const events: Array<{ activeToolCount: number; toolNames: string[] }> = [];
+      watcher.on("session", (event) => {
+        if (event.session.sessionId === TEST_SESSION_ID) {
+          events.push({
+            activeToolCount: event.session.activeTools.length,
+            toolNames: event.session.activeTools.map((t: { toolName: string }) => t.toolName),
+          });
+        }
+      });
+
+      await watcher.start();
+
+      // 1. Create session
+      await writeFile(TEST_LOG_FILE, createUserEntry("multi-tool"));
+      await new Promise((r) => setTimeout(r, 1000));
+
+      // 2. Write two tool signals
+      const toolFile1 = signalFile("tool.toolu_01", {});
+      const toolFile2 = signalFile("tool.toolu_02", {});
+      await writeFile(toolFile1, JSON.stringify({
+        session_id: TEST_SESSION_ID,
+        tool_use_id: "toolu_01",
+        tool_name: "Read",
+        tool_input: { file_path: "/a.ts" },
+        started_at: new Date().toISOString(),
+      }));
+      await new Promise((r) => setTimeout(r, 300));
+      await writeFile(toolFile2, JSON.stringify({
+        session_id: TEST_SESSION_ID,
+        tool_use_id: "toolu_02",
+        tool_name: "Grep",
+        tool_input: { pattern: "foo" },
+        started_at: new Date().toISOString(),
+      }));
+      await new Promise((r) => setTimeout(r, 500));
+
+      // Should have 2 active tools
+      const withBoth = events[events.length - 1];
+      expect(withBoth.activeToolCount).toBe(2);
+      expect(withBoth.toolNames).toContain("Read");
+      expect(withBoth.toolNames).toContain("Grep");
+
+      // 3. Remove one → only one remains
+      await rm(toolFile1, { force: true });
+      await new Promise((r) => setTimeout(r, 500));
+
+      const withOne = events[events.length - 1];
+      expect(withOne.activeToolCount).toBe(1);
+      expect(withOne.toolNames).toContain("Grep");
+
+      // 4. Remove the other → empty
+      await rm(toolFile2, { force: true });
+      await new Promise((r) => setTimeout(r, 500));
+
+      watcher.stop();
+      await new Promise((r) => setTimeout(r, 100));
+
+      const empty = events[events.length - 1];
+      expect(empty.activeToolCount).toBe(0);
     });
   });
 

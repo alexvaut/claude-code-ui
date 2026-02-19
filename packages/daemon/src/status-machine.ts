@@ -1,9 +1,9 @@
 /**
  * Unified session state machine.
  *
- * A single pure transition function handles ALL events — from JSONL entries,
- * hook signals, timers, and periodic checks. The machine state IS the session
- * status. No separate signal maps or priority chains needed.
+ * A single pure transition function handles ALL events — from hook signals,
+ * timers, and periodic checks. The machine state IS the session status.
+ * State transitions come exclusively from hooks; JSONL is for content only.
  *
  * States:
  *   working         — Claude is actively processing
@@ -26,7 +26,7 @@
  *   · = no transition (stay in current state)
  */
 
-import type { LogEntry, AssistantEntry, UserEntry, SystemEntry } from "./types.js";
+import type { LogEntry, AssistantEntry, UserEntry } from "./types.js";
 
 // ---------------------------------------------------------------------------
 // Machine types
@@ -127,88 +127,23 @@ export function machineStateToPublishedStatus(state: SessionMachineState): {
 }
 
 // ---------------------------------------------------------------------------
-// JSONL → machine event mapping
+// JSONL metadata extraction (content only, no state transitions)
 // ---------------------------------------------------------------------------
 
-/**
- * Convert a JSONL log entry to a machine event.
- * Returns null if the entry doesn't cause a state change.
- */
-export function logEntryToSessionEvent(entry: LogEntry): SessionEvent | null {
-  if (entry.type === "user") {
-    const userEntry = entry as UserEntry;
-    const content = userEntry.message.content;
-
-    if (typeof content === "string") {
-      return { type: "WORKING" };
-    } else if (Array.isArray(content)) {
-      // tool_result → WORKING (tool completed, back to work)
-      const hasToolResult = content.some((b) => b.type === "tool_result");
-      if (hasToolResult) {
-        return { type: "WORKING" };
-      }
-      // Text blocks in array form (user prompt with images, etc.)
-      const hasTextBlock = content.some((b) => b.type === "text");
-      if (hasTextBlock) {
-        return { type: "WORKING" };
-      }
-    }
-  }
-
-  if (entry.type === "assistant") {
-    const assistantEntry = entry as AssistantEntry;
-    const hasToolUse = assistantEntry.message.content.some(
-      (b) => b.type === "tool_use"
-    );
-
-    if (hasToolUse) {
-      // From JSONL alone we can't distinguish "waiting for approval" from
-      // "auto-approved and executing". Treat all tool_use as WORKING — the
-      // PERMISSION_REQUEST event should only come from the PermissionRequest hook
-      // which fires precisely when user approval is actually needed.
-      return { type: "WORKING" };
-    }
-
-    // Text-only assistant message — no state change
-    return null;
-  }
-
-  if (entry.type === "system") {
-    const systemEntry = entry as SystemEntry;
-    if (systemEntry.subtype === "turn_duration" || systemEntry.subtype === "stop_hook_summary") {
-      return { type: "STOP" };
-    }
-  }
-
-  return null;
-}
-
-// ---------------------------------------------------------------------------
-// Replay: derive state + metadata from a full entry list
-// ---------------------------------------------------------------------------
-
-const STALE_TIMEOUT_MS = 15 * 1000;
-
-export interface ReplayResult {
-  state: SessionMachineState;
+export interface EntryMetadata {
   lastActivityAt: string;
   messageCount: number;
 }
 
 /**
- * Replay all log entries through the machine to derive current state + metadata.
- * Used for initial session load and JSONL-only (no hooks) status derivation.
+ * Extract metadata (timestamps, message counts) from log entries.
+ * Does NOT derive state — state comes exclusively from hook signals.
  */
-export function replayEntries(
-  entries: LogEntry[],
-  isWorktree: boolean,
-): ReplayResult {
-  let state: SessionMachineState = "waiting";
+export function extractEntryMetadata(entries: LogEntry[]): EntryMetadata {
   let lastActivityAt = "";
   let messageCount = 0;
 
   for (const entry of entries) {
-    // Update metadata from entry timestamp
     const timestamp = "timestamp" in entry ? (entry as { timestamp: string }).timestamp : "";
     if (timestamp) {
       lastActivityAt = timestamp;
@@ -229,25 +164,7 @@ export function replayEntries(
       const hasToolUse = assistantEntry.message.content.some((b) => b.type === "tool_use");
       if (hasToolUse) messageCount += 1;
     }
-
-    // Transition state
-    const event = logEntryToSessionEvent(entry);
-    if (event) {
-      state = transition(state, event, isWorktree);
-    }
   }
 
-  // Apply stale timeout for sessions with old activity.
-  // Note: "tasking" is deliberately excluded — subagents run independently,
-  // so the primary session being silent is expected.
-  if (lastActivityAt) {
-    const elapsed = Date.now() - new Date(lastActivityAt).getTime();
-    if (elapsed > STALE_TIMEOUT_MS) {
-      if (state === "working" || state === "needs_approval") {
-        state = transition(state, { type: "STOP" }, isWorktree);
-      }
-    }
-  }
-
-  return { state, lastActivityAt, messageCount };
+  return { lastActivityAt, messageCount };
 }

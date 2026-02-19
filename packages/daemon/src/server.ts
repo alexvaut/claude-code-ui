@@ -140,6 +140,7 @@ export class StreamServer {
       recentOutput: extractRecentOutput(sessionState.entries),
       pr,
       activeTasks: sessionState.activeTasks,
+      activeTools: formatActiveTools(sessionState),
       todoProgress: sessionState.todoProgress,
     };
 
@@ -193,6 +194,7 @@ export class StreamServer {
       recentOutput: extractRecentOutput(sessionState.entries),
       pr,
       activeTasks: sessionState.activeTasks,
+      activeTools: formatActiveTools(sessionState),
       todoProgress: sessionState.todoProgress,
     };
 
@@ -289,41 +291,47 @@ function shortenPath(filepath: string | undefined): string {
 }
 
 /**
- * Extract pending tool info from session state
+ * Format a tool target string for display.
+ * Reused by extractPendingTool and formatActiveTools.
+ */
+function formatToolTarget(tool: string, input: Record<string, unknown>): string {
+  if (tool === "Edit" || tool === "Read" || tool === "Write") {
+    return shortenPath(input.file_path as string);
+  } else if (tool === "Bash") {
+    return ((input.command as string) ?? "").slice(0, 60);
+  } else if (tool === "Grep" || tool === "Glob") {
+    return (input.pattern as string) ?? "";
+  } else if (tool === "Task") {
+    return (input.description as string) ?? "task";
+  }
+  return JSON.stringify(input).slice(0, 50);
+}
+
+/**
+ * Extract pending tool info from hook-provided permission data.
  */
 function extractPendingTool(session: SessionState): Session["pendingTool"] {
-  if (!session.status.hasPendingToolUse) {
+  if (!session.status.hasPendingToolUse || !session.pendingPermission) {
     return null;
   }
+  const tool = session.pendingPermission.tool_name;
+  const input = (session.pendingPermission.tool_input ?? {}) as Record<string, unknown>;
+  const target = formatToolTarget(tool, input);
+  return { tool, target };
+}
 
-  // Find the last assistant message with tool_use (excluding Task - subagents run automatically)
-  const entries = session.entries;
-  for (let i = entries.length - 1; i >= 0; i--) {
-    const entry = entries[i];
-    if (entry.type === "assistant") {
-      for (const block of entry.message.content) {
-        if (block.type === "tool_use" && block.name !== "Task") {
-          const tool = block.name;
-          // Extract target based on tool type
-          let target = "";
-          const input = block.input as Record<string, unknown>;
-
-          if (tool === "Edit" || tool === "Read" || tool === "Write") {
-            target = (input.file_path as string) ?? "";
-          } else if (tool === "Bash") {
-            target = (input.command as string) ?? "";
-          } else if (tool === "Grep" || tool === "Glob") {
-            target = (input.pattern as string) ?? "";
-          } else {
-            target = JSON.stringify(input).slice(0, 50);
-          }
-
-          return { tool, target };
-        }
-      }
-    }
-  }
-
-  return null;
+/**
+ * Format activeTools for the published session.
+ * Filters out Task tools (shown separately as activeTasks).
+ */
+function formatActiveTools(sessionState: SessionState): Session["activeTools"] {
+  return (sessionState.activeTools ?? [])
+    .filter(t => t.toolName !== "Task")
+    .map(t => ({
+      toolUseId: t.toolUseId,
+      toolName: t.toolName,
+      target: formatToolTarget(t.toolName, t.toolInput),
+      startedAt: t.startedAt,
+    }));
 }
 
