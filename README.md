@@ -5,32 +5,35 @@ A real-time dashboard for monitoring Claude Code sessions across multiple projec
 ## Features
 
 - **Real-time updates** via Durable Streams
-- **Kanban board** showing sessions by status (Working, Needs Approval, Waiting, Idle)
-- **AI-powered summaries** of session activity using Claude Sonnet
-- **PR & CI tracking** - see associated PRs and their CI status
-- **Multi-repo support** - sessions grouped by GitHub repository
+- **Kanban board** — 6 columns: Working, Tasking, Needs Approval, Waiting, Review, Idle
+- **Hook-driven status** — 8 Claude Code hooks provide instant, accurate state transitions
+- **Subagent tracking** — live badges showing active Task tool invocations
+- **Git worktree support** — worktree sessions grouped with parent repo, dedicated Review column
+- **Active tool display** — see which tools Claude is currently executing
+- **AI-powered summaries** of session activity
+- **PR & CI tracking** with inline status badges
+- **Todo progress** — task completion counters on session cards
 
-https://github.com/user-attachments/assets/877a43af-25f9-4751-88eb-24e7bbda68da
 
 ## Architecture
 
 ```
 ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
 │  Claude Code    │     │     Daemon      │     │       UI        │
-│   Sessions      │────▶│   (Watcher)     │────▶│   (React)       │
-│  ~/.claude/     │     │                 │     │                 │
-│   projects/     │     │  Durable Stream │     │  TanStack DB    │
+│   Hooks         │────▶│   (Watcher)     │────▶│   (React)       │
+│  session-signals│     │                 │     │                 │
+│  + JSONL logs   │     │  Durable Stream │     │  TanStack DB    │
 └─────────────────┘     └─────────────────┘     └─────────────────┘
 ```
 
 ### Daemon (`packages/daemon`)
 
-Watches `~/.claude/projects/` for session log changes and:
-- Parses JSONL log files incrementally
-- Derives session status using XState state machine
+Watches hook signal files in `~/.claude/session-signals/` for instant state transitions:
+- Reads JSONL logs for content only (timestamps, message counts, todo progress)
+- Pure state machine with 6 states, worktree-aware transitions
 - Generates AI summaries via Claude Sonnet API
-- Detects git branches and polls for PR/CI status
-- Publishes state updates to Durable Streams
+- Detects git info with worktree support; persistent cache
+- Publishes state over Durable Streams (port 4450); transition logs on port 4451
 
 ### UI (`packages/ui`)
 
@@ -38,59 +41,46 @@ React app using TanStack Router and Radix UI:
 - Subscribes to Durable Streams for real-time updates
 - Groups sessions by GitHub repository
 - Shows session cards with goal, summary, branch/PR info
-- Hover cards with recent output preview
+- Active subagent and tool badges on session cards
+- Todo progress counters
+- Markdown-rendered hover cards with syntax highlighting
 
 ## Session Status State Machine
 
-The daemon uses an XState state machine to determine session status:
-
-```
-                    ┌─────────────────┐
-                    │      idle       │
-                    └────────┬────────┘
-                             │ USER_PROMPT
-                             ▼
-┌─────────────────┐  TOOL_RESULT  ┌─────────────────┐
-│ waiting_for_    │◄──────────────│     working     │
-│   approval      │               └────────┬────────┘
-└────────┬────────┘                        │
-         │                    ┌────────────┼────────────┐
-         │                    │            │            │
-         │              TURN_END    ASSISTANT_   STALE_
-         │                    │      TOOL_USE   TIMEOUT
-         │                    ▼            │            │
-         │            ┌─────────────────┐  │            │
-         │            │ waiting_for_   │◄─┘            │
-         └───────────▶│     input      │◄──────────────┘
-           IDLE_      └─────────────────┘
-          TIMEOUT
-```
+The daemon uses a pure transition function driven entirely by hook signals (not JSONL parsing). See `packages/daemon/HOOK-LIFECYCLE.md` for full hook event documentation.
 
 ### States
 
 | State | Description | UI Column |
 |-------|-------------|-----------|
-| `idle` | No activity for 5+ minutes | Idle |
 | `working` | Claude is actively processing | Working |
-| `waiting_for_approval` | Tool use needs user approval | Needs Approval |
-| `waiting_for_input` | Claude finished, waiting for user | Waiting |
+| `tasking` | Claude is delegating to subagents | Tasking |
+| `needs_approval` | Tool awaiting user approval (internal; published as `waiting` + `hasPendingToolUse`) | Needs Approval |
+| `waiting` | Turn ended, waiting for user | Waiting |
+| `review` | Worktree session paused — code ready for review | Review |
+| `idle` | Session ended | Idle |
 
-### Events (from log entries)
+### Events (from hooks)
 
-| Event | Source | Description |
-|-------|--------|-------------|
-| `USER_PROMPT` | User entry with string content | User sent a message |
-| `TOOL_RESULT` | User entry with tool_result array | User approved/ran tool |
-| `ASSISTANT_STREAMING` | Assistant entry (no tool_use) | Claude is outputting |
-| `ASSISTANT_TOOL_USE` | Assistant entry with tool_use | Claude requested a tool |
-| `TURN_END` | System entry (turn_duration/stop_hook_summary) | Turn completed |
+| Event | Hook source |
+|-------|-------------|
+| `WORKING` | UserPromptSubmit |
+| `STOP` | Stop |
+| `ENDED` | SessionEnd |
+| `PERMISSION_REQUEST` | PermissionRequest (3s debounce) |
+| `TASK_STARTED` | PreToolUse/Task |
+| `TASKS_DONE` | PostToolUse/Task (last task) |
+| `WORKTREE_DELETED` | Stale check detects deleted worktree |
 
-### Timeout Fallbacks
+### Worktree-Aware Transitions
 
-For older Claude Code versions or sessions without hooks:
-- **5 seconds**: If tool_use pending → `waiting_for_approval`
-- **60 seconds**: If no turn-end marker → `waiting_for_input`
-- **5 minutes**: No activity → `idle`
+Non-worktree sessions: `STOP` → `waiting`, `ENDED` → `idle`
+Worktree sessions: `STOP`/`ENDED` → `review` (stays visible until worktree is deleted)
+
+### Safeguards
+
+- Permission requests are debounced (3s) to avoid false positives from auto-approved tools
+- Stale timeout (60s) catches sessions that miss a Stop hook
 
 ## Setup
 
@@ -100,15 +90,13 @@ For older Claude Code versions or sessions without hooks:
 pnpm install
 ```
 
-### 2. Configure PermissionRequest hook (recommended)
-
-For accurate "Needs Approval" detection, install the PermissionRequest hook:
+### 2. Install session hooks
 
 ```bash
 pnpm run setup
 ```
 
-This adds a hook to `~/.claude/settings.json` that notifies the daemon when Claude Code is waiting for user permission. Without this hook, the daemon uses heuristics based on tool names which may be less accurate.
+This installs 8 hooks into `~/.claude/settings.json` (UserPromptSubmit, PermissionRequest, PreToolUse, PostToolUse, PostToolUseFailure, Stop, SessionEnd, PreCompact) that write signal files for real-time status tracking.
 
 ### 3. Set API key
 
@@ -134,11 +122,3 @@ pnpm start
 pnpm serve  # Start daemon on port 4450
 pnpm dev    # Start UI dev server
 ```
-
-## Dependencies
-
-- **@durable-streams/*** - Real-time state synchronization
-- **@tanstack/db** - Reactive database for UI
-- **xstate** - State machine for status detection
-- **chokidar** - File system watching
-- **@radix-ui/themes** - UI components

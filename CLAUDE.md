@@ -6,7 +6,7 @@ A real-time Kanban dashboard for monitoring Claude Code sessions across projects
 
 pnpm monorepo with two packages:
 
-- **`packages/daemon`** — Node.js backend that watches `~/.claude/projects/**/*.jsonl`, derives session status via XState state machine, and publishes state over `@durable-streams/server` (port 4450)
+- **`packages/daemon`** — Node.js backend that receives hook signals from Claude Code sessions, derives status via a pure state machine, reads JSONL for content only, and publishes state over `@durable-streams/server` (port 4450)
 - **`packages/ui`** — React 19 + Vite 7 frontend that subscribes to the daemon stream via `@tanstack/react-db` and displays sessions in a Kanban board grouped by Git repo
 
 ## Getting Started
@@ -37,7 +37,7 @@ pnpm setup          # install Claude hooks for session signals
 | State / data | `@tanstack/db` + `@tanstack/react-db` via `@durable-streams` — no Redux/Zustand |
 | UI components | Radix UI Themes v3 (dark theme, violet accent) |
 | Daemon runtime | tsx (dev), tsc → `dist/` (prod) |
-| Status engine | XState v5 state machine |
+| Status engine | Pure transition function (hook-signal driven) |
 | Validation | Zod v4 (schemas duplicated in both packages) |
 | Testing | Vitest (daemon only, no UI tests) |
 
@@ -58,11 +58,15 @@ pnpm setup          # install Claude hooks for session signals
 
 ### Daemon
 - `SessionWatcher` (EventEmitter) in `src/watcher.ts` is the core; it drives `StreamServer` in `src/server.ts`
-- Status derived by XState machine (`src/status-machine.ts`): states are `working`, `waiting_for_approval`, `waiting_for_input`
-- Hook signals (`~/.claude/session-signals/*.json`) are authoritative and override JSONL-derived status
-- JSONL parsed incrementally via `tailJSONL()` in `src/parser.ts`
+- State machine is a pure `transition(state, event, isWorktree)` function in `src/status-machine.ts` — 6 internal states (`working`, `tasking`, `needs_approval`, `waiting`, `review`, `idle`), 7 hook events
+- Hook signals (`~/.claude/session-signals/*.json`) are the **sole** source of state transitions — JSONL only provides content (timestamps, message counts, todo progress)
+- `needs_approval` is internal; published as `waiting` with `hasPendingToolUse: true` — 5 public statuses
+- Permission debounce (3s) prevents false "Needs Approval" from auto-approved tools
+- Worktree sessions use `review` instead of `waiting`/`idle`; persistent git cache at `~/.claude/git-info-cache.json` survives worktree deletion
+- Transition logs written to `~/.claude/session-logs/`, served via HTTP on port 4451
 - AI summaries generated with `@anthropic-ai/sdk` (Claude Sonnet) in `src/summarizer.ts`
 - PR/CI status polled via `gh` CLI in `src/github.ts`
+- See `packages/daemon/HOOK-LIFECYCLE.md` for full hook event documentation
 
 ## Key Files
 
@@ -70,9 +74,13 @@ pnpm setup          # install Claude hooks for session signals
 |------|---------|
 | `packages/daemon/src/serve.ts` | Daemon entry point |
 | `packages/daemon/src/watcher.ts` | File watcher + session tracking |
-| `packages/daemon/src/status-machine.ts` | XState status machine |
+| `packages/daemon/src/status-machine.ts` | Pure state transition function (hook-signal driven) |
 | `packages/daemon/src/schema.ts` | Zod schemas + durable streams state schema |
 | `packages/daemon/src/server.ts` | Stream server publishing |
+| `packages/daemon/src/git.ts` | Git info resolution with worktree support |
+| `packages/daemon/src/transition-log.ts` | Per-session state transition logging |
+| `packages/daemon/src/log-server.ts` | HTTP server for transition logs (port 4451) |
+| `packages/daemon/HOOK-LIFECYCLE.md` | Empirical hook event documentation |
 | `packages/ui/src/main.tsx` | React entry point |
 | `packages/ui/src/routes/__root.tsx` | Root layout (Theme, header) |
 | `packages/ui/src/routes/index.tsx` | Main Kanban page |
@@ -83,3 +91,7 @@ pnpm setup          # install Claude hooks for session signals
 ## Verification
 
 - Always verify UI changes with MCP Playwright — save screenshots to `screenshots/` with numbered prefix (e.g. `001-panels.png`)
+
+## Instructions
+
+- `CLAUDE.md` and `README.md` must be kept up to date — every plan must include a step to update docs if the changes affect architecture, states, schemas, or key files
