@@ -5,11 +5,10 @@
 
 import { DurableStreamTestServer } from "@durable-streams/server";
 import { DurableStream } from "@durable-streams/client";
-import { sessionsStateSchema, type Session, type RecentOutput, type PRInfo } from "./schema.js";
+import { sessionsStateSchema, type Session, type RecentOutput } from "./schema.js";
 import type { SessionState } from "./watcher.js";
 import type { LogEntry } from "./types.js";
 import { generateAISummary, generateGoal } from "./summarizer.js";
-import { queuePRCheck, getCachedPR, setOnPRUpdate, stopAllPolling, clearPRForSession } from "./github.js";
 import { log } from "./log.js";
 
 const DEFAULT_PORT = 4450;
@@ -24,8 +23,6 @@ export class StreamServer {
   private stream: DurableStream | null = null;
   private port: number;
   private streamUrl: string;
-  // Track sessions for PR update callbacks
-  private sessionCache = new Map<string, SessionState>();
 
   constructor(options: StreamServerOptions = {}) {
     this.port = options.port ?? DEFAULT_PORT;
@@ -58,20 +55,9 @@ export class StreamServer {
       }
     }
 
-    // Set up PR update callback
-    setOnPRUpdate(async (sessionId, pr) => {
-      log("PR", `Received PR update for session ${sessionId.slice(0, 8)}: ${pr ? `PR #${pr.number}` : "no PR"}`);
-      const sessionState = this.sessionCache.get(sessionId);
-      if (sessionState) {
-        await this.publishSessionWithPR(sessionState, pr);
-      } else {
-        log("PR", `No cached session state for ${sessionId.slice(0, 8)}`);
-      }
-    });
   }
 
   async stop(): Promise<void> {
-    stopAllPolling();
     await this.server.stop();
     this.stream = null;
   }
@@ -88,37 +74,11 @@ export class StreamServer {
       throw new Error("Server not started");
     }
 
-    // Check if branch changed by comparing with cached session
-    const cachedSession = this.sessionCache.get(sessionState.sessionId);
-    const oldBranch = cachedSession?.gitBranch ?? null;
-    const branchChanged = oldBranch !== null && oldBranch !== sessionState.gitBranch;
-
-    if (branchChanged) {
-      log("PR", `Branch changed for ${sessionState.sessionId.slice(0, 8)}: ${oldBranch} → ${sessionState.gitBranch}`);
-      clearPRForSession(sessionState.sessionId, oldBranch, sessionState.cwd);
-    }
-
-    // Cache session state for PR update callbacks
-    this.sessionCache.set(sessionState.sessionId, sessionState);
-
     // Generate AI goal and summary (goals are cached, summaries update more frequently)
     const [goal, summary] = await Promise.all([
       generateGoal(sessionState),
       generateAISummary(sessionState),
     ]);
-
-    // Get cached PR info if available (will be null if branch just changed)
-    const pr = sessionState.gitBranch
-      ? getCachedPR(sessionState.cwd, sessionState.gitBranch)
-      : null;
-
-    // Queue PR check if we have a branch (will update via callback)
-    if (sessionState.gitBranch) {
-      log("PR", `Session ${sessionState.sessionId.slice(0, 8)} has branch: ${sessionState.gitBranch}`);
-      queuePRCheck(sessionState.cwd, sessionState.gitBranch, sessionState.sessionId);
-    } else {
-      log("PR", `Session ${sessionState.sessionId.slice(0, 8)} has no branch`);
-    }
 
     const session: Session = {
       sessionId: sessionState.sessionId,
@@ -138,7 +98,6 @@ export class StreamServer {
       goal,
       summary,
       recentOutput: extractRecentOutput(sessionState.entries),
-      pr,
       activeTasks: sessionState.activeTasks,
       activeTools: formatActiveTools(sessionState),
       todoProgress: sessionState.todoProgress,
@@ -160,47 +119,6 @@ export class StreamServer {
     await this.stream.append(event);
   }
 
-  /**
-   * Publish session with updated PR info (called from PR update callback)
-   */
-  async publishSessionWithPR(sessionState: SessionState, pr: PRInfo | null): Promise<void> {
-    if (!this.stream) {
-      throw new Error("Server not started");
-    }
-
-    // Generate AI goal and summary
-    const [goal, summary] = await Promise.all([
-      generateGoal(sessionState),
-      generateAISummary(sessionState),
-    ]);
-
-    const session: Session = {
-      sessionId: sessionState.sessionId,
-      cwd: sessionState.cwd,
-      gitBranch: sessionState.gitBranch,
-      gitRepoUrl: sessionState.gitRepoUrl,
-      gitRepoId: sessionState.gitRepoId,
-      gitRootPath: sessionState.gitRootPath,
-      isWorktree: sessionState.isWorktree,
-      worktreePath: sessionState.worktreePath,
-      originalPrompt: sessionState.originalPrompt,
-      status: sessionState.status.status,
-      lastActivityAt: sessionState.status.lastActivityAt,
-      messageCount: sessionState.status.messageCount,
-      hasPendingToolUse: sessionState.status.hasPendingToolUse,
-      pendingTool: extractPendingTool(sessionState),
-      goal,
-      summary,
-      recentOutput: extractRecentOutput(sessionState.entries),
-      pr,
-      activeTasks: sessionState.activeTasks,
-      activeTools: formatActiveTools(sessionState),
-      todoProgress: sessionState.todoProgress,
-    };
-
-    const event = sessionsStateSchema.sessions.update({ value: session });
-    await this.stream.append(event);
-  }
 }
 
 /**

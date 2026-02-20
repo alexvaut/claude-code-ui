@@ -93,7 +93,7 @@ export class SessionWatcher extends EventEmitter {
   private toolSignals = new Map<string, Map<string, ActiveTool>>(); // sessionId → toolUseId → ActiveTool
   private compactingSignals = new Map<string, string>(); // sessionId → startedAt
   private debounceTimers = new Map<string, NodeJS.Timeout>();
-  private permissionTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private permissionTimers = new Map<string, { handle: ReturnType<typeof setTimeout>; toolUseId: string | null }>();
   private debounceMs: number;
   private permissionDelayMs: number;
   private staleCheckInterval: NodeJS.Timeout | null = null;
@@ -128,7 +128,7 @@ export class SessionWatcher extends EventEmitter {
     if (prevState === "working" || prevState === "tasking" || prevState === "needs_approval") {
       // Cancel permission debounce timer (any pending debounce is stale)
       const timer = this.permissionTimers.get(sessionId);
-      if (timer) { clearTimeout(timer); this.permissionTimers.delete(sessionId); }
+      if (timer) { clearTimeout(timer.handle); this.permissionTimers.delete(sessionId); }
     }
     if (prevState === "needs_approval" && nextState !== "needs_approval") {
       session.pendingPermission = undefined;
@@ -214,9 +214,20 @@ export class SessionWatcher extends EventEmitter {
         log("Watcher", `Hook PermissionRequest for session ${sessionId}: ${toolName}`);
         appendHookEvent(sessionId, "PermissionRequest", { tool: toolName, hook: "PermissionRequest" });
 
+        // Resolve tool_use_id: from payload directly, or look up from toolSignals
+        let permToolUseId: string | null = payload.tool_use_id ?? null;
+        if (!permToolUseId) {
+          const sessionTools = this.toolSignals.get(sessionId);
+          if (sessionTools) {
+            for (const t of sessionTools.values()) {
+              if (t.toolName === toolName) { permToolUseId = t.toolUseId; break; }
+            }
+          }
+        }
+
         // Cancel any existing debounce timer
         const existingTimer = this.permissionTimers.get(sessionId);
-        if (existingTimer) clearTimeout(existingTimer);
+        if (existingTimer) clearTimeout(existingTimer.handle);
 
         // Debounce: only send PERMISSION_REQUEST after delay.
         // Auto-approved tools fire PostToolUse quickly, which cancels the timer.
@@ -226,12 +237,13 @@ export class SessionWatcher extends EventEmitter {
           tool_input: payload.tool_input,
           pending_since: now,
         };
-        this.permissionTimers.set(sessionId, setTimeout(() => {
+        const handle = setTimeout(() => {
           this.permissionTimers.delete(sessionId);
           const s = this.sessions.get(sessionId);
           if (s) s.pendingPermission = permission;
           this.transitionSession(sessionId, { type: "PERMISSION_REQUEST" }, { event: "PERMISSION_REQUEST", source: "hook", signal: "http:PermissionRequest", tool: toolName });
-        }, this.permissionDelayMs));
+        }, this.permissionDelayMs);
+        this.permissionTimers.set(sessionId, { handle, toolUseId: permToolUseId });
         break;
       }
 
@@ -300,9 +312,14 @@ export class SessionWatcher extends EventEmitter {
         log("Watcher", `Hook ${hook_event_name} for session ${sessionId}: ${toolName} (${toolUseId})`);
         appendHookEvent(sessionId, hook_event_name, { tool: toolName, id: toolUseId, hook: hook_event_name });
 
-        // Clear permission debounce timer — tool completed (auto-approved or user-approved)
-        const timer = this.permissionTimers.get(sessionId);
-        if (timer) { clearTimeout(timer); this.permissionTimers.delete(sessionId); }
+        // Clear permission debounce timer — only if this tool matches the pending permission
+        const permTimer = this.permissionTimers.get(sessionId);
+        if (permTimer) {
+          if (!permTimer.toolUseId || !toolUseId || permTimer.toolUseId === toolUseId) {
+            clearTimeout(permTimer.handle);
+            this.permissionTimers.delete(sessionId);
+          }
+        }
 
         // If in needs_approval, transition back to working
         const session = this.sessions.get(sessionId);
@@ -354,8 +371,8 @@ export class SessionWatcher extends EventEmitter {
         appendHookEvent(sessionId, "Stop", { hook: "Stop" });
 
         // Clear permission debounce timer
-        const permTimer = this.permissionTimers.get(sessionId);
-        if (permTimer) { clearTimeout(permTimer); this.permissionTimers.delete(sessionId); }
+        const stopPermTimer = this.permissionTimers.get(sessionId);
+        if (stopPermTimer) { clearTimeout(stopPermTimer.handle); this.permissionTimers.delete(sessionId); }
 
         // Clear compacting signal
         if (this.compactingSignals.has(sessionId)) {
@@ -376,8 +393,8 @@ export class SessionWatcher extends EventEmitter {
         appendHookEvent(sessionId, "SessionEnd", { reason: payload.reason, hook: "SessionEnd" });
 
         // Clear permission debounce timer
-        const permTimer = this.permissionTimers.get(sessionId);
-        if (permTimer) { clearTimeout(permTimer); this.permissionTimers.delete(sessionId); }
+        const endPermTimer = this.permissionTimers.get(sessionId);
+        if (endPermTimer) { clearTimeout(endPermTimer.handle); this.permissionTimers.delete(sessionId); }
 
         this.transitionSession(sessionId, { type: "ENDED" }, { event: "ENDED", source: "hook", signal: "http:SessionEnd" });
         break;
@@ -495,7 +512,7 @@ export class SessionWatcher extends EventEmitter {
 
     // Clear all permission debounce timers
     for (const timer of this.permissionTimers.values()) {
-      clearTimeout(timer);
+      clearTimeout(timer.handle);
     }
     this.permissionTimers.clear();
   }

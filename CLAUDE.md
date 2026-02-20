@@ -65,7 +65,6 @@ pnpm setup          # install Claude hooks for session signals
 - Worktree sessions use `review` instead of `waiting`/`idle`; persistent git cache at `~/.claude/git-info-cache.json` survives worktree deletion
 - Transition logs written to `~/.claude/session-logs/`, served via HTTP on port 4451; logs include both `[hook]` event lines (every hook event) and state transition lines
 - AI summaries generated with `@anthropic-ai/sdk` (Claude Sonnet) in `src/summarizer.ts`
-- PR/CI status polled via `gh` CLI in `src/github.ts`
 - See `packages/daemon/HOOK-LIFECYCLE.md` for full hook event documentation
 
 ## Key Files

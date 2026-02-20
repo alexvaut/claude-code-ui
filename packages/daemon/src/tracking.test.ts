@@ -698,6 +698,41 @@ describe("Session Tracking", () => {
       expect(approvalEvents.length).toBeGreaterThan(0);
     });
 
+    // === Concurrent tool: PostToolUse for different tool must NOT cancel pending debounce ===
+
+    it("PostToolUse for different tool does NOT cancel PermissionRequest debounce", async () => {
+      await seedSession();
+      // Tool A: Bash needs permission
+      await watcher.handleHook(makePayload({
+        hook_event_name: "PreToolUse",
+        tool_name: "Bash",
+        tool_use_id: "toolu_bash_01",
+      }));
+      await watcher.handleHook(makePayload({
+        hook_event_name: "PermissionRequest",
+        tool_name: "Bash",
+        tool_use_id: "toolu_bash_01",
+      }));
+      // Tool B: Read auto-approved, completes within debounce window
+      vi.advanceTimersByTime(500);
+      await watcher.handleHook(makePayload({
+        hook_event_name: "PreToolUse",
+        tool_name: "Read",
+        tool_use_id: "toolu_read_02",
+      }));
+      await watcher.handleHook(makePayload({
+        hook_event_name: "PostToolUse",
+        tool_name: "Read",
+        tool_use_id: "toolu_read_02",
+      }));
+      // Still within debounce — not yet needs_approval
+      expect(lastMachineState()).toBe("working");
+      // Advance past debounce — Bash's timer should still fire
+      vi.advanceTimersByTime(3000);
+      expect(lastMachineState()).toBe("needs_approval");
+      expect(lastStatus().hasPendingToolUse).toBe(true);
+    });
+
     // === Worktree behavior ===
 
     it("Stop on non-worktree session → waiting", async () => {

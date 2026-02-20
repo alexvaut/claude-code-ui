@@ -19,25 +19,6 @@ export const RecentOutputSchema = z.object({
 });
 export type RecentOutput = z.infer<typeof RecentOutputSchema>;
 
-// CI check status
-export const CIStatusSchema = z.enum(["pending", "running", "success", "failure", "cancelled", "unknown"]);
-export type CIStatus = z.infer<typeof CIStatusSchema>;
-
-// PR info
-export const PRInfoSchema = z.object({
-  number: z.number(),
-  url: z.string(),
-  title: z.string(),
-  ciStatus: CIStatusSchema,
-  ciChecks: z.array(z.object({
-    name: z.string(),
-    status: CIStatusSchema,
-    url: z.string().nullable(),
-  })),
-  lastChecked: z.string(),
-});
-export type PRInfo = z.infer<typeof PRInfoSchema>;
-
 // Main session state schema
 export const SessionSchema = z.object({
   sessionId: z.string(),
@@ -57,7 +38,6 @@ export const SessionSchema = z.object({
   goal: z.string(), // High-level goal of the session
   summary: z.string(), // Current activity summary
   recentOutput: z.array(RecentOutputSchema),
-  pr: PRInfoSchema.nullable(), // Associated PR if branch has one
   activeTasks: z.array(z.object({
     toolUseId: z.string(),
     agentType: z.string(),
