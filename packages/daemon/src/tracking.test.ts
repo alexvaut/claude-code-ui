@@ -48,6 +48,25 @@ function createUserEntry(content: string, timestamp = new Date().toISOString()) 
   }) + "\n";
 }
 
+function createUserEntryArray(blocks: Array<{ type: string; text: string }>, timestamp = new Date().toISOString()) {
+  return JSON.stringify({
+    type: "user",
+    parentUuid: null,
+    uuid: `uuid-${Date.now()}-${Math.random()}`,
+    sessionId: TEST_SESSION_ID,
+    timestamp,
+    cwd: "/Users/test/project",
+    version: "1.0.0",
+    gitBranch: "main",
+    isSidechain: false,
+    userType: "external",
+    message: {
+      role: "user",
+      content: blocks,
+    },
+  }) + "\n";
+}
+
 function createAssistantEntry(content: string, timestamp = new Date().toISOString(), hasToolUse = false) {
   const blocks: Array<{ type: string; text?: string; id?: string; name?: string; input?: Record<string, unknown> }> = [
     { type: "text", text: content },
@@ -128,6 +147,33 @@ describe("Session Tracking", () => {
       expect(metadata?.cwd).toBe("/Users/test/project");
       expect(metadata?.gitBranch).toBe("main");
       expect(metadata?.originalPrompt).toBe("Help me build a feature");
+    });
+
+    it("should extract originalPrompt from array content (multimodal)", async () => {
+      const entry = createUserEntryArray([
+        { type: "text", text: "<ide_opened_file>The user opened the file c:\\src\\backstage\\.tasks\\new.md in the IDE. This may or may not be related to the current task.</ide_opened_file>" },
+        { type: "text", text: "Remove Domains and system views from dependency plugin" },
+      ]);
+      await writeFile(TEST_LOG_FILE, entry);
+
+      const { entries } = await tailJSONL(TEST_LOG_FILE, 0);
+      const metadata = extractMetadata(entries);
+
+      expect(metadata).not.toBeNull();
+      expect(metadata?.originalPrompt).toBe("Remove Domains and system views from dependency plugin");
+    });
+
+    it("should fall back to '(no prompt found)' when all array blocks are system tags", async () => {
+      const entry = createUserEntryArray([
+        { type: "text", text: "<ide_opened_file>The user opened file.ts</ide_opened_file>" },
+      ]);
+      await writeFile(TEST_LOG_FILE, entry);
+
+      const { entries } = await tailJSONL(TEST_LOG_FILE, 0);
+      const metadata = extractMetadata(entries);
+
+      expect(metadata).not.toBeNull();
+      expect(metadata?.originalPrompt).toBe("(no prompt found)");
     });
 
     it("should handle incremental reads", async () => {
@@ -809,6 +855,51 @@ describe("Session Tracking", () => {
       expect(lastMachineState()).toBe("idle");
     });
 
+    it("working session stale check uses 3-minute timeout", async () => {
+      await seedSession();
+      expect(lastMachineState()).toBe("working");
+      // 65s should NOT trigger stale check (old 60s timeout would have)
+      vi.advanceTimersByTime(65_000);
+      await watcher.triggerStaleCheck();
+      expect(lastMachineState()).toBe("working");
+      // 181s should trigger it
+      vi.advanceTimersByTime(120_000);
+      await watcher.triggerStaleCheck();
+      expect(lastMachineState()).toBe("waiting");
+    });
+
+    it("PreToolUse recovers session from false stale-check (waiting → working)", async () => {
+      await seedSession();
+      expect(lastMachineState()).toBe("working");
+      // Simulate stale check pushing to waiting
+      vi.advanceTimersByTime(180_001);
+      await watcher.triggerStaleCheck();
+      expect(lastMachineState()).toBe("waiting");
+      // Now a PreToolUse fires — should recover to working
+      await watcher.handleHook(makePayload({
+        hook_event_name: "PreToolUse",
+        tool_name: "Read",
+        tool_use_id: "toolu_recover_01",
+      }));
+      expect(lastMachineState()).toBe("working");
+    });
+
+    it("PreToolUse/Task recovers session from waiting → tasking", async () => {
+      await seedSession();
+      // Simulate stale check pushing to waiting
+      vi.advanceTimersByTime(180_001);
+      await watcher.triggerStaleCheck();
+      expect(lastMachineState()).toBe("waiting");
+      // Now a Task tool fires — should recover to working then escalate to tasking
+      await watcher.handleHook(makePayload({
+        hook_event_name: "PreToolUse",
+        tool_name: "Task",
+        tool_use_id: "toolu_recover_task",
+        tool_input: { subagent_type: "Plan", description: "Design plan" },
+      }));
+      expect(lastMachineState()).toBe("tasking");
+    });
+
     // === Multi-tool / multi-task ===
 
     it("Two concurrent tools → activeTools has 2 entries", async () => {
@@ -1413,5 +1504,108 @@ describe("Session Tracking", () => {
       expect(fallback.rootPath).toBe(normalizedRepoRoot);
       expect(fallback.branch).toBeNull();
     }, 90000);
+  });
+});
+
+// -------------------------------------------------------------------
+// extractRecentOutput tag stripping
+// -------------------------------------------------------------------
+import { extractRecentOutput } from "./server.js";
+import type { LogEntry } from "./types.js";
+
+function makeUserEntry(content: string | unknown[]): LogEntry {
+  return {
+    type: "user",
+    parentUuid: null,
+    uuid: `uuid-${Date.now()}-${Math.random()}`,
+    sessionId: "test",
+    timestamp: new Date().toISOString(),
+    cwd: "/test",
+    version: "1.0.0",
+    gitBranch: "main",
+    isSidechain: false,
+    userType: "external",
+    message: { role: "user", content },
+  } as unknown as LogEntry;
+}
+
+function makeAssistantEntry(textContent: string): LogEntry {
+  return {
+    type: "assistant",
+    parentUuid: null,
+    uuid: `uuid-${Date.now()}-${Math.random()}`,
+    sessionId: "test",
+    timestamp: new Date().toISOString(),
+    cwd: "/test",
+    version: "1.0.0",
+    gitBranch: "main",
+    isSidechain: false,
+    userType: "external",
+    message: {
+      role: "assistant",
+      content: [{ type: "text", text: textContent }],
+    },
+  } as unknown as LogEntry;
+}
+
+describe("extractRecentOutput tag stripping", () => {
+  it("strips system tags from user string entries", () => {
+    const entries = [
+      makeUserEntry("<ide_opened_file>file.ts opened</ide_opened_file>\nfix the bug"),
+    ];
+    const output = extractRecentOutput(entries);
+    expect(output).toHaveLength(1);
+    expect(output[0].content).toBe("fix the bug");
+    expect(output[0].role).toBe("user");
+  });
+
+  it("skips user entries that are entirely system tags", () => {
+    const entries = [
+      makeUserEntry("<task-notification>\n<task-id>abc</task-id>\n</task-notification>"),
+    ];
+    const output = extractRecentOutput(entries);
+    expect(output).toHaveLength(0);
+  });
+
+  it("handles user array content with system tag in first block", () => {
+    const entries = [
+      makeUserEntry([
+        { type: "text", text: "<ide_opened_file>The user opened file.ts</ide_opened_file>" },
+        { type: "text", text: "the catalog has changed restart backstage" },
+      ]),
+    ];
+    const output = extractRecentOutput(entries);
+    expect(output).toHaveLength(1);
+    expect(output[0].content).toBe("the catalog has changed restart backstage");
+    expect(output[0].role).toBe("user");
+  });
+
+  it("skips user array entries where all text blocks are system tags", () => {
+    const entries = [
+      makeUserEntry([
+        { type: "text", text: "<ide_opened_file>file.ts</ide_opened_file>" },
+      ]),
+    ];
+    const output = extractRecentOutput(entries);
+    expect(output).toHaveLength(0);
+  });
+
+  it("strips system-reminder from assistant text", () => {
+    const entries = [
+      makeAssistantEntry("Here is the result.\n\n<system-reminder>Warning: check for malware</system-reminder>"),
+    ];
+    const output = extractRecentOutput(entries);
+    expect(output).toHaveLength(1);
+    expect(output[0].content).toBe("Here is the result.");
+    expect(output[0].content).not.toContain("system-reminder");
+  });
+
+  it("preserves clean assistant text unchanged", () => {
+    const entries = [
+      makeAssistantEntry("Backstage is starting up in the background (frontend on port 3000, backend on port 7007)."),
+    ];
+    const output = extractRecentOutput(entries);
+    expect(output).toHaveLength(1);
+    expect(output[0].content).toBe("Backstage is starting up in the background (frontend on port 3000, backend on port 7007).");
   });
 });

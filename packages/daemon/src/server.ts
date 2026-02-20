@@ -9,6 +9,7 @@ import { sessionsStateSchema, type Session, type RecentOutput } from "./schema.j
 import type { SessionState } from "./watcher.js";
 import type { LogEntry } from "./types.js";
 import { generateAISummary, generateGoal } from "./summarizer.js";
+import { stripSystemTags } from "./strip-tags.js";
 import { log } from "./log.js";
 
 const DEFAULT_PORT = 4450;
@@ -74,10 +75,16 @@ export class StreamServer {
       throw new Error("Server not started");
     }
 
-    // Generate AI goal and summary (goals are cached, summaries update more frequently)
+    // Clean originalPrompt at the publishing boundary (raw data stays in watcher)
+    const cleanedState = {
+      ...sessionState,
+      originalPrompt: stripSystemTags(sessionState.originalPrompt),
+    };
+
+    // Generate AI goal and summary using cleaned state
     const [goal, summary] = await Promise.all([
-      generateGoal(sessionState),
-      generateAISummary(sessionState),
+      generateGoal(cleanedState),
+      generateAISummary(cleanedState),
     ]);
 
     const session: Session = {
@@ -89,7 +96,7 @@ export class StreamServer {
       gitRootPath: sessionState.gitRootPath,
       isWorktree: sessionState.isWorktree,
       worktreePath: sessionState.worktreePath,
-      originalPrompt: sessionState.originalPrompt,
+      originalPrompt: cleanedState.originalPrompt,
       status: sessionState.status.status,
       lastActivityAt: sessionState.status.lastActivityAt,
       messageCount: sessionState.status.messageCount,
@@ -125,7 +132,7 @@ export class StreamServer {
  * Extract recent output from entries for live view
  * Returns the last few meaningful messages in chronological order
  */
-function extractRecentOutput(entries: LogEntry[], maxItems = 8): RecentOutput[] {
+export function extractRecentOutput(entries: LogEntry[], maxItems = 8): RecentOutput[] {
   const output: RecentOutput[] = [];
 
   // Get the last N entries that are messages (user or assistant)
@@ -135,13 +142,16 @@ function extractRecentOutput(entries: LogEntry[], maxItems = 8): RecentOutput[] 
 
   for (const entry of messageEntries) {
     if (entry.type === "assistant") {
-      // Get first text block if any
+      // Get first text block if any — strip system tags
       const textBlock = entry.message.content.find((b) => b.type === "text" && b.text.trim());
       if (textBlock && textBlock.type === "text") {
-        output.push({
-          role: "assistant",
-          content: textBlock.text.slice(0, 500),
-        });
+        const cleaned = stripSystemTags(textBlock.text);
+        if (cleaned) {
+          output.push({
+            role: "assistant",
+            content: cleaned.slice(0, 500),
+          });
+        }
       }
 
       // Get tool uses
@@ -155,12 +165,24 @@ function extractRecentOutput(entries: LogEntry[], maxItems = 8): RecentOutput[] 
         }
       }
     } else if (entry.type === "user") {
-      // User prompts (string content, not tool results)
-      if (typeof entry.message.content === "string" && entry.message.content.trim()) {
-        output.push({
-          role: "user",
-          content: entry.message.content.slice(0, 300),
-        });
+      const { content } = entry.message;
+      if (typeof content === "string" && content.trim()) {
+        // String content — strip system tags before slicing
+        const cleaned = stripSystemTags(content);
+        if (cleaned) {
+          output.push({ role: "user", content: cleaned.slice(0, 300) });
+        }
+      } else if (Array.isArray(content)) {
+        // Array content (multimodal) — find first meaningful text block
+        for (const block of content) {
+          if (block.type === "text") {
+            const cleaned = stripSystemTags(block.text);
+            if (cleaned) {
+              output.push({ role: "user", content: cleaned.slice(0, 300) });
+              break;
+            }
+          }
+        }
       }
     }
   }

@@ -15,13 +15,13 @@
  *
  * Transition table:
  *
- *              WORKING  STOP(wt)  STOP(!wt)  ENDED(wt)  ENDED(!wt)  PERM_REQ        TASK_STARTED  TASKS_DONE  WORKTREE_DEL
- *   working      ·      review    waiting    review     idle        needs_approval   tasking          ·           ·
- *   tasking      ·      review    waiting    review     idle        needs_approval      ·          working        ·
- *   needs_appr working  review    waiting    review     idle        needs_approval      ·             ·           ·
- *   waiting    working    ·          ·       review     idle        needs_approval      ·             ·           ·
- *   review     working    ·          ·          ·          ·            ·                ·             ·          idle
- *   idle       working    ·          ·          ·          ·            ·                ·             ·           ·
+ *              WORKING  STOP(wt)  STOP(!wt)  ENDED(wt)  ENDED(!wt)  PERM_REQ        TASK_STARTED  TASKS_DONE  WORKTREE_DEL  TOOL_ACT
+ *   working      ·      review    waiting    review     idle        needs_approval   tasking          ·           ·              ·
+ *   tasking      ·      review    waiting    review     idle        needs_approval      ·          working        ·              ·
+ *   needs_appr working  review    waiting    review     idle        needs_approval      ·             ·           ·              ·
+ *   waiting    working    ·          ·       review     idle        needs_approval      ·             ·           ·           working
+ *   review     working    ·          ·          ·          ·            ·                ·             ·          idle         working
+ *   idle       working    ·          ·          ·          ·            ·                ·             ·           ·           working
  *
  *   · = no transition (stay in current state)
  */
@@ -47,7 +47,8 @@ export type SessionEvent =
   | { type: "PERMISSION_REQUEST" }
   | { type: "WORKTREE_DELETED" }
   | { type: "TASK_STARTED" }
-  | { type: "TASKS_DONE" };
+  | { type: "TASKS_DONE" }
+  | { type: "TOOL_ACTIVITY" };
 
 // ---------------------------------------------------------------------------
 // Pure transition function
@@ -89,6 +90,7 @@ export function transition(
     case "waiting":
       switch (event.type) {
         case "WORKING": return "working";
+        case "TOOL_ACTIVITY": return "working";
         case "ENDED": return isWorktree ? "review" : "idle";
         case "PERMISSION_REQUEST": return "needs_approval";
         default: return state;
@@ -97,6 +99,7 @@ export function transition(
     case "review":
       switch (event.type) {
         case "WORKING": return "working";
+        case "TOOL_ACTIVITY": return "working";
         case "WORKTREE_DELETED": return "idle";
         default: return state;
       }
@@ -104,6 +107,7 @@ export function transition(
     case "idle":
       switch (event.type) {
         case "WORKING": return "working";
+        case "TOOL_ACTIVITY": return "working";
         default: return state;
       }
   }

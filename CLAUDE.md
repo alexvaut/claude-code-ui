@@ -58,12 +58,12 @@ pnpm setup          # install Claude hooks for session signals
 
 ### Daemon
 - `SessionWatcher` (EventEmitter) in `src/watcher.ts` is the core; it drives `StreamServer` in `src/server.ts`
-- State machine is a pure `transition(state, event, isWorktree)` function in `src/status-machine.ts` — 6 internal states (`working`, `tasking`, `needs_approval`, `waiting`, `review`, `idle`), 7 hook events
+- State machine is a pure `transition(state, event, isWorktree)` function in `src/status-machine.ts` — 6 internal states (`working`, `tasking`, `needs_approval`, `waiting`, `review`, `idle`), 8 hook events
 - Hooks forward raw JSON payloads via HTTP POST (`POST /hook` on port 4451) to the daemon — a single `forward-hook.sh` script handles all 8 hook events; the daemon's `handleHook()` method is the sole source of state transitions — JSONL only provides content (timestamps, message counts, todo progress)
 - `needs_approval` is internal; published as `waiting` with `hasPendingToolUse: true` — 5 public statuses
 - Permission debounce (3s) prevents false "Needs Approval" from auto-approved tools
 - Worktree sessions use `review` instead of `waiting`/`idle`; persistent git cache at `~/.claude/git-info-cache.json` survives worktree deletion
-- Idle timeout: daemon's `checkStaleSessions()` moves `waiting`/`needs_approval` sessions to `idle` after 1 hour of inactivity — no UI-side state overrides
+- Idle timeout: daemon's `checkStaleSessions()` moves `waiting`/`needs_approval` sessions to `idle` after 1 hour of inactivity
 - `SessionEnd` with `reason: "other"` is ignored from `waiting` state (VS Code sessions can resume); only `reason: "prompt_input_exit"` triggers the `ENDED` transition
 - Transition logs written to `~/.claude/session-logs/`, served via HTTP on port 4451; logs include both `[hook]` event lines (every hook event) and state transition lines
 - AI summaries generated with `@anthropic-ai/sdk` (Claude Sonnet) in `src/summarizer.ts`
@@ -79,6 +79,7 @@ pnpm setup          # install Claude hooks for session signals
 | `packages/daemon/src/status-machine.ts` | Pure state transition function (hook-driven) |
 | `packages/daemon/src/schema.ts` | Zod schemas + durable streams state schema |
 | `packages/daemon/src/server.ts` | Stream server publishing |
+| `packages/daemon/src/strip-tags.ts` | System XML tag stripping for clean display |
 | `packages/daemon/src/git.ts` | Git info resolution with worktree support |
 | `packages/daemon/src/transition-log.ts` | Per-session state transition + hook event logging |
 | `packages/daemon/src/log-server.ts` | HTTP server for transition logs + hook endpoint (port 4451) |

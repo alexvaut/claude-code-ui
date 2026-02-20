@@ -3,3 +3,4 @@ node_modules
 packages/daemon/dist
 .playwright-mcp/*.log
 .tasks/
+screenshots/

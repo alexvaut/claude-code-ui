@@ -27,6 +27,7 @@ const IDLE_TIMEOUT_MS = 60 * 60 * 1000; // 1 hour — waiting/needs_approval ses
 export interface PendingPermission {
   session_id: string;
   tool_name: string;
+  tool_use_id?: string;
   tool_input?: Record<string, unknown>;
   pending_since: string;
 }
@@ -235,6 +236,7 @@ export class SessionWatcher extends EventEmitter {
         const permission: PendingPermission = {
           session_id: sessionId,
           tool_name: toolName,
+          tool_use_id: permToolUseId ?? undefined,
           tool_input: payload.tool_input,
           pending_since: now,
         };
@@ -271,7 +273,10 @@ export class SessionWatcher extends EventEmitter {
           const session = this.sessions.get(sessionId);
           if (session) {
             session.activeTools = this.getActiveToolsForSession(sessionId);
-            this.emit("session", { type: "updated", session } satisfies SessionEvent);
+            // TOOL_ACTIVITY: no-op from working/tasking/needs_approval, recovers from waiting/review/idle
+            if (!this.transitionSession(sessionId, { type: "TOOL_ACTIVITY" }, { event: "TOOL_ACTIVITY", source: "hook", signal: `http:PreToolUse(${toolName})` })) {
+              this.emit("session", { type: "updated", session } satisfies SessionEvent);
+            }
           }
 
           // If this is a Task tool, also track as active task
@@ -315,19 +320,28 @@ export class SessionWatcher extends EventEmitter {
 
         // Clear permission debounce timer — only if this tool matches the pending permission
         const permTimer = this.permissionTimers.get(sessionId);
+        let matchesPendingPerm = false;
         if (permTimer) {
           if (!permTimer.toolUseId || !toolUseId || permTimer.toolUseId === toolUseId) {
             clearTimeout(permTimer.handle);
             this.permissionTimers.delete(sessionId);
+            matchesPendingPerm = true;
           }
         }
 
-        // If in needs_approval, transition back to working
         const session = this.sessions.get(sessionId);
-        if (session?.machineState === "needs_approval") {
-          this.transitionSession(sessionId, { type: "WORKING" },
-            { event: "WORKING", source: "hook", signal: `http:${hook_event_name}` });
+
+        // Check against already-fired pendingPermission on the session
+        if (!matchesPendingPerm && session?.pendingPermission) {
+          matchesPendingPerm = !session.pendingPermission.tool_use_id
+            || !toolUseId
+            || session.pendingPermission.tool_use_id === toolUseId;
         }
+
+        // Matching tool → WORKING (clears needs_approval), other → TOOL_ACTIVITY (no-op from needs_approval)
+        const event = matchesPendingPerm ? "WORKING" : "TOOL_ACTIVITY";
+        this.transitionSession(sessionId, { type: event },
+          { event, source: "hook", signal: `http:${hook_event_name}(${toolName})` });
 
         // Remove active tool
         if (toolUseId) {
@@ -568,13 +582,15 @@ export class SessionWatcher extends EventEmitter {
    */
   private async checkStaleSessions(): Promise<void> {
     for (const session of this.sessions.values()) {
-      // Safety-net stale timeout: working sessions get STOP after 60s inactivity.
+      // Safety-net stale timeout: working sessions get STOP after 3 min inactivity.
       // Hooks should handle this via the Stop event, but this catches edge cases
       // where hooks fail to fire. "tasking" is deliberately excluded — subagents
       // run independently, so the primary session being silent is expected.
+      // 3 minutes allows for long text generation (plan mode, long responses)
+      // where no tools fire and no JSONL writes occur.
       if (session.machineState === "working") {
         const elapsed = Date.now() - new Date(session.status.lastActivityAt).getTime();
-        if (elapsed > 60_000) {
+        if (elapsed > 180_000) {
           this.transitionSession(session.sessionId, { type: "STOP" }, { event: "STOP", source: "stale-check", elapsed });
         }
       }

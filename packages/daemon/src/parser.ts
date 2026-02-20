@@ -5,6 +5,7 @@ import type {
   UserEntry,
   isUserEntry,
 } from "./types.js";
+import { stripSystemTags } from "./strip-tags.js";
 
 export interface TailResult {
   entries: LogEntry[];
@@ -117,8 +118,22 @@ export function extractMetadata(entries: LogEntry[]): SessionMetadata | null {
     if (entry.type === "user" && !originalPrompt) {
       const content = entry.message.content;
       if (typeof content === "string") {
-        originalPrompt =
-          content.length > 300 ? content.slice(0, 300) + "..." : content;
+        const cleaned = stripSystemTags(content);
+        if (cleaned) {
+          originalPrompt =
+            cleaned.length > 300 ? cleaned.slice(0, 300) + "..." : cleaned;
+        }
+      } else if (Array.isArray(content)) {
+        for (const block of content) {
+          if (block.type === "text") {
+            const cleaned = stripSystemTags(block.text);
+            if (cleaned) {
+              originalPrompt =
+                cleaned.length > 300 ? cleaned.slice(0, 300) + "..." : cleaned;
+              break;
+            }
+          }
+        }
       }
     }
 

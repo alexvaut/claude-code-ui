@@ -106,30 +106,21 @@ function getRoleColor(role: "user" | "assistant" | "tool"): string {
 
 export function SessionCard({ session, disableHover }: SessionCardProps) {
   const showPendingTool = session.hasPendingToolUse && session.pendingTool;
-  // Show path from ~ (e.g., ~/programs/project) — handles both Unix and Windows paths
-  const dirPath = session.cwd.replace(/^(?:[A-Za-z]:[\\/])?Users[\\/][^\\/]+/, "~");
 
   return (
     <HoverCard.Root openDelay={750} open={disableHover ? false : undefined}>
       <HoverCard.Trigger>
         <Card size="2" className={getCardClass(session)}>
           <Flex direction="column" gap="4" style={{ minWidth: 0 }}>
-            {/* Header: directory and time */}
-            <Flex justify="between" align="center" style={{ minWidth: 0 }}>
-              <Box style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0, flex: 1 }}>
-                <Text size="1" color="gray" style={{ fontFamily: "var(--code-font-family)" }}>
-                  {dirPath}
-                </Text>
-              </Box>
+            {/* Header: goal + time */}
+            <Flex justify="between" align="start" gap="2" style={{ minWidth: 0 }}>
+              <Heading size="3" weight="medium" highContrast style={{ overflowWrap: "anywhere", minWidth: 0, flex: 1 }}>
+                {session.goal || session.originalPrompt.slice(0, 50)}
+              </Heading>
               <Text size="1" color="gray" style={{ flexShrink: 0 }}>
                 {formatTimeAgo(session.lastActivityAt)}
               </Text>
             </Flex>
-
-            {/* Main content: goal as primary text */}
-            <Heading size="3" weight="medium" highContrast style={{ overflowWrap: "anywhere", minWidth: 0 }}>
-              {session.goal || session.originalPrompt.slice(0, 50)}
-            </Heading>
 
             {/* Active agents */}
             {session.activeTasks.length > 0 && (
