@@ -309,6 +309,12 @@ describe("Session Tracking", () => {
     it("waiting + STOP → waiting (no-op)", () => {
       expect(transition("waiting", { type: "STOP" }, false)).toBe("waiting");
     });
+    it("waiting + ENDED → idle (non-worktree)", () => {
+      expect(transition("waiting", { type: "ENDED" }, false)).toBe("idle");
+    });
+    it("waiting + ENDED → review (worktree)", () => {
+      expect(transition("waiting", { type: "ENDED" }, true)).toBe("review");
+    });
 
     // From review — THE BUG FIX
     it("review + WORKING → working", () => {
@@ -763,6 +769,46 @@ describe("Session Tracking", () => {
       expect(lastMachineState()).toBe("working");
     });
 
+    // === SessionEnd reason filtering ===
+
+    it("SessionEnd(prompt_input_exit) from waiting → idle", async () => {
+      await seedSession();
+      await watcher.handleHook(makePayload({ hook_event_name: "Stop" }));
+      expect(lastMachineState()).toBe("waiting");
+      await watcher.handleHook(makePayload({ hook_event_name: "SessionEnd", reason: "prompt_input_exit" }));
+      expect(lastMachineState()).toBe("idle");
+    });
+
+    it("SessionEnd(other) from waiting → stays waiting", async () => {
+      await seedSession();
+      await watcher.handleHook(makePayload({ hook_event_name: "Stop" }));
+      expect(lastMachineState()).toBe("waiting");
+      await watcher.handleHook(makePayload({ hook_event_name: "SessionEnd", reason: "other" }));
+      expect(lastMachineState()).toBe("waiting");
+    });
+
+    // === Stale check idle timeout ===
+
+    it("waiting session goes idle via stale check after 1 hour", async () => {
+      await seedSession();
+      await watcher.handleHook(makePayload({ hook_event_name: "Stop" }));
+      expect(lastMachineState()).toBe("waiting");
+      vi.advanceTimersByTime(3_600_001);
+      await watcher.triggerStaleCheck();
+      expect(lastMachineState()).toBe("idle");
+    });
+
+    it("needs_approval session goes idle via stale check after 1 hour", async () => {
+      await seedSession();
+      await watcher.handleHook(makePayload({ hook_event_name: "PreToolUse", tool_name: "Bash", tool_use_id: "t1" }));
+      await watcher.handleHook(makePayload({ hook_event_name: "PermissionRequest", tool_name: "Bash" }));
+      vi.advanceTimersByTime(3100);
+      expect(lastMachineState()).toBe("needs_approval");
+      vi.advanceTimersByTime(3_600_001);
+      await watcher.triggerStaleCheck();
+      expect(lastMachineState()).toBe("idle");
+    });
+
     // === Multi-tool / multi-task ===
 
     it("Two concurrent tools → activeTools has 2 entries", async () => {
@@ -879,9 +925,8 @@ describe("Session Tracking", () => {
       await watcher.handleHook(makePayload({ hook_event_name: "Stop" }));
       expect(lastMachineState()).toBe("waiting");
 
-      // SessionEnd from waiting is a no-op (already done).
-      // To reach idle, SessionEnd must fire from working/tasking directly.
-      await watcher.handleHook(makePayload({ hook_event_name: "SessionEnd" }));
+      // SessionEnd(other) from waiting is a no-op (VS Code sessions stay alive)
+      await watcher.handleHook(makePayload({ hook_event_name: "SessionEnd", reason: "other" }));
       expect(lastMachineState()).toBe("waiting");
 
       // Restart and go directly to idle via SessionEnd from working

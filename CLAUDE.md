@@ -63,6 +63,8 @@ pnpm setup          # install Claude hooks for session signals
 - `needs_approval` is internal; published as `waiting` with `hasPendingToolUse: true` — 5 public statuses
 - Permission debounce (3s) prevents false "Needs Approval" from auto-approved tools
 - Worktree sessions use `review` instead of `waiting`/`idle`; persistent git cache at `~/.claude/git-info-cache.json` survives worktree deletion
+- Idle timeout: daemon's `checkStaleSessions()` moves `waiting`/`needs_approval` sessions to `idle` after 1 hour of inactivity — no UI-side state overrides
+- `SessionEnd` with `reason: "other"` is ignored from `waiting` state (VS Code sessions can resume); only `reason: "prompt_input_exit"` triggers the `ENDED` transition
 - Transition logs written to `~/.claude/session-logs/`, served via HTTP on port 4451; logs include both `[hook]` event lines (every hook event) and state transition lines
 - AI summaries generated with `@anthropic-ai/sdk` (Claude Sonnet) in `src/summarizer.ts`
 - See `packages/daemon/HOOK-LIFECYCLE.md` for full hook event documentation

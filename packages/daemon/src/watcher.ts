@@ -22,6 +22,7 @@ import { appendTransition, appendHookEvent, type TransitionMeta } from "./transi
 import type { HookPayload } from "./hook-handler.js";
 
 const CLAUDE_PROJECTS_DIR = `${process.env.HOME}/.claude/projects`;
+const IDLE_TIMEOUT_MS = 60 * 60 * 1000; // 1 hour — waiting/needs_approval sessions go idle after this
 
 export interface PendingPermission {
   session_id: string;
@@ -396,6 +397,12 @@ export class SessionWatcher extends EventEmitter {
         const endPermTimer = this.permissionTimers.get(sessionId);
         if (endPermTimer) { clearTimeout(endPermTimer.handle); this.permissionTimers.delete(sessionId); }
 
+        // From waiting, only act on explicit exit — ignore transient disconnects (reason: "other")
+        const endSession = this.sessions.get(sessionId);
+        if (endSession?.machineState === "waiting" && payload.reason !== "prompt_input_exit") {
+          break;
+        }
+
         this.transitionSession(sessionId, { type: "ENDED" }, { event: "ENDED", source: "hook", signal: "http:SessionEnd" });
         break;
       }
@@ -581,8 +588,19 @@ export class SessionWatcher extends EventEmitter {
           this.transitionSession(session.sessionId, { type: "WORKTREE_DELETED" }, { event: "WORKTREE_DELETED", source: "stale-check" });
         }
       }
+
+      // Idle timeout: waiting/needs_approval sessions go idle after 1 hour of inactivity
+      if (session.machineState === "waiting" || session.machineState === "needs_approval") {
+        const elapsed = Date.now() - new Date(session.status.lastActivityAt).getTime();
+        if (elapsed > IDLE_TIMEOUT_MS) {
+          this.transitionSession(session.sessionId, { type: "ENDED" }, { event: "ENDED", source: "stale-check", elapsed });
+        }
+      }
     }
   }
+
+  /** Exposed for testing — triggers the periodic stale check immediately. */
+  async triggerStaleCheck(): Promise<void> { await this.checkStaleSessions(); }
 
   private debouncedHandleFile(filepath: string): void {
     // Clear existing timer for this file

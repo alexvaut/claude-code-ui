@@ -2,25 +2,7 @@ import { Box, Flex, Heading, IconButton, Link, Text, Separator, Tooltip } from "
 import { KanbanColumn } from "./KanbanColumn";
 import { VSCodeIcon } from "./VSCodeIcon";
 import { toVSCodeUri } from "../lib/vscodeUri";
-import type { Session, SessionStatus } from "../data/schema";
-
-const IDLE_TIMEOUT_MS = 60 * 60 * 1000; // 1 hour - match daemon setting
-
-/**
- * Get effective status based on elapsed time since last activity.
- * Sessions inactive for 1 hour are considered idle regardless of stored status.
- */
-function getEffectiveStatus(session: Session): SessionStatus {
-  // Review and tasking statuses are daemon-controlled, don't override
-  if (session.status === "review" || session.status === "tasking") {
-    return session.status;
-  }
-  const elapsed = Date.now() - new Date(session.lastActivityAt).getTime();
-  if (elapsed > IDLE_TIMEOUT_MS) {
-    return "idle";
-  }
-  return session.status;
-}
+import type { Session } from "../data/schema";
 
 interface RepoSectionProps {
   repoId: string;
@@ -30,17 +12,16 @@ interface RepoSectionProps {
 }
 
 export function RepoSection({ repoId, repoUrl, sessions, activityScore }: RepoSectionProps) {
-  // Use effective status to categorize sessions (accounts for time-based idle)
-  const working = sessions.filter((s) => getEffectiveStatus(s) === "working");
-  const tasking = sessions.filter((s) => getEffectiveStatus(s) === "tasking");
+  const working = sessions.filter((s) => s.status === "working");
+  const tasking = sessions.filter((s) => s.status === "tasking");
   const needsApproval = sessions.filter(
-    (s) => getEffectiveStatus(s) === "waiting" && s.hasPendingToolUse
+    (s) => s.status === "waiting" && s.hasPendingToolUse
   );
   const waiting = sessions.filter(
-    (s) => getEffectiveStatus(s) === "waiting" && !s.hasPendingToolUse
+    (s) => s.status === "waiting" && !s.hasPendingToolUse
   );
-  const review = sessions.filter((s) => getEffectiveStatus(s) === "review");
-  const idle = sessions.filter((s) => getEffectiveStatus(s) === "idle");
+  const review = sessions.filter((s) => s.status === "review");
+  const idle = sessions.filter((s) => s.status === "idle");
 
   const isHot = activityScore > 50;
 

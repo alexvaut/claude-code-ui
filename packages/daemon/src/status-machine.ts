@@ -19,7 +19,7 @@
  *   working      ·      review    waiting    review     idle        needs_approval   tasking          ·           ·
  *   tasking      ·      review    waiting    review     idle        needs_approval      ·          working        ·
  *   needs_appr working  review    waiting    review     idle        needs_approval      ·             ·           ·
- *   waiting    working    ·          ·          ·          ·         needs_approval      ·             ·           ·
+ *   waiting    working    ·          ·       review     idle        needs_approval      ·             ·           ·
  *   review     working    ·          ·          ·          ·            ·                ·             ·          idle
  *   idle       working    ·          ·          ·          ·            ·                ·             ·           ·
  *
@@ -89,6 +89,7 @@ export function transition(
     case "waiting":
       switch (event.type) {
         case "WORKING": return "working";
+        case "ENDED": return isWorktree ? "review" : "idle";
         case "PERMISSION_REQUEST": return "needs_approval";
         default: return state;
       }
