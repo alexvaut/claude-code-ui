@@ -395,6 +395,49 @@ export class SessionWatcher extends EventEmitter {
         }
         break;
       }
+
+      // --- Logging-only hooks (no state transitions) ---
+
+      case "SessionStart": {
+        const source = (payload.source as string) ?? "unknown";
+        log("Watcher", `Hook SessionStart for session ${sessionId} (source=${source})`);
+        appendHookEvent(sessionId, "SessionStart", { hook: "SessionStart", source });
+        break;
+      }
+
+      case "SubagentStart": {
+        const agentType = (payload.agent_type as string) ?? "unknown";
+        const agentId = (payload.agent_id as string) ?? "";
+        log("Watcher", `Hook SubagentStart for session ${sessionId}: ${agentType} (${agentId})`);
+        appendHookEvent(sessionId, "SubagentStart", { hook: "SubagentStart", agent: agentType, id: agentId });
+        break;
+      }
+
+      case "SubagentStop": {
+        const agentType = (payload.agent_type as string) ?? "unknown";
+        const agentId = (payload.agent_id as string) ?? "";
+        log("Watcher", `Hook SubagentStop for session ${sessionId}: ${agentType} (${agentId})`);
+        appendHookEvent(sessionId, "SubagentStop", { hook: "SubagentStop", agent: agentType, id: agentId });
+        break;
+      }
+
+      case "TeammateIdle": {
+        log("Watcher", `Hook TeammateIdle for session ${sessionId}`);
+        appendHookEvent(sessionId, "TeammateIdle", { hook: "TeammateIdle" });
+        break;
+      }
+
+      case "TaskCompleted": {
+        log("Watcher", `Hook TaskCompleted for session ${sessionId}`);
+        appendHookEvent(sessionId, "TaskCompleted", { hook: "TaskCompleted" });
+        break;
+      }
+
+      case "Notification": {
+        log("Watcher", `Hook Notification for session ${sessionId}`);
+        appendHookEvent(sessionId, "Notification", { hook: "Notification" });
+        break;
+      }
     }
   }
 

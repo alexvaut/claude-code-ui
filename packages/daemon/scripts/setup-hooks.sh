@@ -1,7 +1,7 @@
 #!/bin/bash
 # Setup script for claude-code-ui daemon hooks
 #
-# Registers a single hook script (forward-hook.sh) for all 8 hook events.
+# Registers a single hook script (forward-hook.sh) for all 14 hook events.
 # The script forwards the raw hook payload to the daemon via HTTP POST.
 # The daemon handles all state transitions internally.
 
@@ -99,8 +99,9 @@ OLD_SCRIPTS=(
   "compact-start.sh"
 )
 HOOK_TYPES=(
-  "UserPromptSubmit" "PermissionRequest" "PreToolUse"
+  "SessionStart" "UserPromptSubmit" "PermissionRequest" "PreToolUse"
   "PostToolUse" "PostToolUseFailure" "Stop" "SessionEnd" "PreCompact"
+  "Notification" "SubagentStart" "SubagentStop" "TeammateIdle" "TaskCompleted"
 )
 
 for old_script in "${OLD_SCRIPTS[@]}"; do
@@ -109,7 +110,7 @@ for old_script in "${OLD_SCRIPTS[@]}"; do
   done
 done
 
-# Register forward-hook.sh for all 8 hook events
+# Register forward-hook.sh for all 14 hook events
 FORWARD_HOOK="$SCRIPT_DIR/hooks/forward-hook.sh"
 for hook_type in "${HOOK_TYPES[@]}"; do
   upsert_hook "$hook_type" "" "$FORWARD_HOOK"
@@ -139,9 +140,10 @@ fi
 
 echo ""
 echo "Installed hooks to $SETTINGS_FILE:"
-echo "  All 8 hook events → forward-hook.sh → HTTP POST to daemon"
-echo "  (UserPromptSubmit, PermissionRequest, PreToolUse, PostToolUse,"
-echo "   PostToolUseFailure, Stop, SessionEnd, PreCompact)"
+echo "  All 14 hook events → forward-hook.sh → HTTP POST to daemon"
+echo "  (SessionStart, UserPromptSubmit, PermissionRequest, PreToolUse,"
+echo "   PostToolUse, PostToolUseFailure, Stop, SessionEnd, PreCompact,"
+echo "   Notification, SubagentStart, SubagentStop, TeammateIdle, TaskCompleted)"
 if [ "$DEBUG_HOOKS" = true ]; then
   echo "  + Debug: all 14 hook events logged to hook-debug.log"
 fi

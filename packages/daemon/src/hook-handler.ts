@@ -9,6 +9,7 @@ import type { SessionWatcher } from "./watcher.js";
 import { log } from "./log.js";
 
 const HookEventNames = [
+  "SessionStart",
   "UserPromptSubmit",
   "PermissionRequest",
   "PreToolUse",
@@ -17,6 +18,11 @@ const HookEventNames = [
   "Stop",
   "SessionEnd",
   "PreCompact",
+  "Notification",
+  "SubagentStart",
+  "SubagentStop",
+  "TeammateIdle",
+  "TaskCompleted",
 ] as const;
 
 export type HookEventName = (typeof HookEventNames)[number];
@@ -32,6 +38,9 @@ export const HookPayloadSchema = z.object({
   permission_mode: z.string().optional(),
   reason: z.string().optional(),
   prompt: z.string().optional(),
+  source: z.string().optional(),
+  agent_id: z.string().optional(),
+  agent_type: z.string().optional(),
 }).passthrough();
 
 export type HookPayload = z.infer<typeof HookPayloadSchema>;

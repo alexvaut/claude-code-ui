@@ -6,18 +6,18 @@ Verified by logging all 14 hook events via `debug-hook.sh`.
 
 | # | Hook Event | Matcher support | Forwarded to daemon |
 |---|-----------|----------------|---------------------|
-| 1 | `SessionStart` | session start type | no |
+| 1 | `SessionStart` | session start type | yes |
 | 2 | `UserPromptSubmit` | no | yes |
 | 3 | `PreToolUse` | tool name | yes |
 | 4 | `PermissionRequest` | tool name | yes |
 | 5 | `PostToolUse` | tool name | yes |
 | 6 | `PostToolUseFailure` | tool name | yes |
-| 7 | `Notification` | notification type | no |
-| 8 | `SubagentStart` | agent type | no |
-| 9 | `SubagentStop` | agent type | no |
+| 7 | `Notification` | notification type | yes |
+| 8 | `SubagentStart` | agent type | yes |
+| 9 | `SubagentStop` | agent type | yes |
 | 10 | `Stop` | no | yes |
-| 11 | `TeammateIdle` | no | no |
-| 12 | `TaskCompleted` | no | no |
+| 11 | `TeammateIdle` | no | yes |
+| 12 | `TaskCompleted` | no | yes |
 | 13 | `PreCompact` | compaction type | yes |
 | 14 | `SessionEnd` | exit reason | yes |
 
