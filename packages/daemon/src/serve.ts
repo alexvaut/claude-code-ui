@@ -60,14 +60,14 @@ async function main(): Promise<void> {
   const streamServer = new StreamServer({ port: PORT });
   await streamServer.start();
 
-  // Start the transition log HTTP server
-  await startLogServer();
+  // Create session watcher (needed by log server for hook ingestion)
+  const watcher = new SessionWatcher({ debounceMs: 300 });
+
+  // Start the HTTP server (transition logs + hook endpoint)
+  await startLogServer(undefined, watcher);
 
   console.log(`Stream URL: ${colors.cyan}${streamServer.getStreamUrl()}${colors.reset}`);
   console.log();
-
-  // Start the session watcher
-  const watcher = new SessionWatcher({ debounceMs: 300 });
 
   watcher.on("session", async (event: SessionEvent) => {
     const { type, session } = event;

@@ -122,3 +122,18 @@ pnpm start
 pnpm serve  # Start daemon on port 4450
 pnpm dev    # Start UI dev server
 ```
+
+
+## Hook → daemon state mapping
+
+| Hook Event | Daemon Action |
+|-----------|---------------|
+| `UserPromptSubmit` | Create session if new, transition → `working` |
+| `PermissionRequest` | Start 3s debounce timer → `needs_approval` if not cancelled |
+| `PreToolUse` | Track active tool. If `tool_name=Task`, also track active task → `tasking` |
+| `PostToolUse` | Clear permission timer. Remove active tool. If Task, remove active task → `working` if tasks empty |
+| `PostToolUseFailure` | Same cleanup as `PostToolUse` |
+| `Stop` | Clear permission timer. Clear compacting. Transition → `waiting`/`review` |
+| `SessionEnd` | Clear permission timer. Transition → `idle`/`review` |
+| `PreCompact` | Add synthetic "Compacting context" task |
+

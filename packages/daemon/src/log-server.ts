@@ -1,6 +1,8 @@
 /**
- * Tiny HTTP server that serves per-session transition log files.
- * GET /logs/:sessionId → pipes ~/.claude/session-logs/<sessionId>.log
+ * HTTP server for transition logs and hook signal ingestion.
+ *
+ * GET  /logs/:sessionId → pipes ~/.claude/session-logs/<sessionId>.log
+ * POST /hook            → receives forwarded Claude Code hook payloads
  */
 
 import { createServer, type Server } from "node:http";
@@ -8,7 +10,9 @@ import { createReadStream } from "node:fs";
 import { access, constants } from "node:fs/promises";
 import { join } from "node:path";
 import { SESSION_LOGS_DIR } from "./transition-log.js";
+import { handleHookRequest } from "./hook-handler.js";
 import { log } from "./log.js";
+import type { SessionWatcher } from "./watcher.js";
 
 const DEFAULT_PORT = 4451;
 
@@ -17,15 +21,29 @@ const SESSION_ID_RE = /^[a-zA-Z0-9_-]+$/;
 
 let server: Server | null = null;
 
-export async function startLogServer(port = DEFAULT_PORT): Promise<void> {
+export async function startLogServer(port = DEFAULT_PORT, watcher?: SessionWatcher): Promise<void> {
   return new Promise((resolve, reject) => {
     server = createServer(async (req, res) => {
       // CORS
       res.setHeader("Access-Control-Allow-Origin", "*");
 
       if (req.method === "OPTIONS") {
-        res.writeHead(204);
+        res.writeHead(204, {
+          "Access-Control-Allow-Methods": "GET, POST",
+          "Access-Control-Allow-Headers": "Content-Type",
+        });
         res.end();
+        return;
+      }
+
+      // POST /hook — forward hook payloads to watcher
+      if (req.method === "POST" && req.url === "/hook") {
+        if (!watcher) {
+          res.writeHead(503, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Watcher not ready" }));
+          return;
+        }
+        await handleHookRequest(req, res, watcher);
         return;
       }
 
@@ -35,7 +53,7 @@ export async function startLogServer(port = DEFAULT_PORT): Promise<void> {
         return;
       }
 
-      // Parse /logs/:sessionId
+      // GET /logs/:sessionId
       const match = req.url?.match(/^\/logs\/([^/]+)$/);
       if (!match) {
         res.writeHead(404, { "Content-Type": "text/plain" });
@@ -68,7 +86,7 @@ export async function startLogServer(port = DEFAULT_PORT): Promise<void> {
     });
 
     server.listen(port, "127.0.0.1", () => {
-      log("LogServer", `Serving transition logs on http://127.0.0.1:${port}`);
+      log("LogServer", `Serving on http://127.0.0.1:${port} (logs + hooks)`);
       resolve();
     });
 

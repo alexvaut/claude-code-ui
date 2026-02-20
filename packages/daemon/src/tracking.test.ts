@@ -4,18 +4,20 @@
  * Tests the full flow: file detection → parsing → status → publishing
  */
 
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdir, writeFile, rm, appendFile } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import { execFileSync } from "node:child_process";
+import { Readable } from "node:stream";
 import { SessionWatcher } from "./watcher.js";
+import type { HookPayload } from "./hook-handler.js";
+import { handleHookRequest } from "./hook-handler.js";
 import { tailJSONL, extractMetadata } from "./parser.js";
 import { transition } from "./status-machine.js";
 import { getGitInfo, getGitInfoCached, _resetGitCaches } from "./git.js";
 
 const TEST_DIR = path.join(os.homedir(), ".claude", "projects", "-test-e2e-session");
-const SIGNALS_DIR = path.join(os.homedir(), ".claude", "session-signals");
 
 // Generate unique IDs per test run to avoid conflicts
 function getTestSessionId(): string {
@@ -256,103 +258,6 @@ describe("Session Tracking", () => {
     });
   });
 
-  describe("Permission Signal Debounce", () => {
-    let permissionFile: string;
-
-    beforeEach(async () => {
-      await mkdir(SIGNALS_DIR, { recursive: true });
-      permissionFile = path.join(SIGNALS_DIR, `${TEST_SESSION_ID}.permission.json`);
-    });
-
-    afterEach(async () => {
-      // Clean up signal file if it still exists
-      await rm(permissionFile, { force: true });
-    });
-
-    it("should NOT show 'Needs Approval' when permission resolves within debounce window", async () => {
-      const watcher = new SessionWatcher({ debounceMs: 50, permissionDelayMs: 1000 });
-
-      const events: Array<{ type: string; status: string; hasPendingToolUse: boolean }> = [];
-      watcher.on("session", (event) => {
-        if (event.session.sessionId === TEST_SESSION_ID) {
-          events.push({
-            type: event.type,
-            status: event.session.status.status,
-            hasPendingToolUse: event.session.status.hasPendingToolUse,
-          });
-        }
-      });
-
-      await watcher.start();
-
-      // Create session file (status: working)
-      await writeFile(TEST_LOG_FILE, createUserEntry("Do something in plan mode"));
-      await new Promise((r) => setTimeout(r, 1000));
-
-      // Write permission signal (simulating auto-approved tool like EnterPlanMode)
-      await writeFile(permissionFile, JSON.stringify({
-        session_id: TEST_SESSION_ID,
-        tool_name: "EnterPlanMode",
-        pending_since: new Date().toISOString(),
-      }));
-
-      // Wait briefly (well within debounce window)
-      await new Promise((r) => setTimeout(r, 200));
-
-      // Remove permission (simulating quick auto-approval)
-      await rm(permissionFile, { force: true });
-
-      // Wait for watcher to process the removal
-      await new Promise((r) => setTimeout(r, 500));
-
-      watcher.stop();
-      await new Promise((r) => setTimeout(r, 100));
-
-      // No event should have hasPendingToolUse: true — debounce prevented the flicker
-      const approvalEvents = events.filter(e => e.hasPendingToolUse);
-      expect(approvalEvents).toHaveLength(0);
-    });
-
-    it("should show 'Needs Approval' when permission persists past debounce window", async () => {
-      const watcher = new SessionWatcher({ debounceMs: 50, permissionDelayMs: 1000 });
-
-      const events: Array<{ type: string; status: string; hasPendingToolUse: boolean }> = [];
-      watcher.on("session", (event) => {
-        if (event.session.sessionId === TEST_SESSION_ID) {
-          events.push({
-            type: event.type,
-            status: event.session.status.status,
-            hasPendingToolUse: event.session.status.hasPendingToolUse,
-          });
-        }
-      });
-
-      await watcher.start();
-
-      // Create session file (status: working)
-      await writeFile(TEST_LOG_FILE, createUserEntry("Run a bash command"));
-      await new Promise((r) => setTimeout(r, 1000));
-
-      // Write permission signal (simulating blocking tool like Bash)
-      await writeFile(permissionFile, JSON.stringify({
-        session_id: TEST_SESSION_ID,
-        tool_name: "Bash",
-        pending_since: new Date().toISOString(),
-      }));
-
-      // Wait past the debounce window (1000ms delay + buffer)
-      await new Promise((r) => setTimeout(r, 2000));
-
-      watcher.stop();
-      await new Promise((r) => setTimeout(r, 100));
-
-      // Should have an event with hasPendingToolUse: true after the debounce period
-      const approvalEvents = events.filter(e => e.hasPendingToolUse);
-      expect(approvalEvents.length).toBeGreaterThan(0);
-      expect(approvalEvents[0].status).toBe("waiting");
-    });
-  });
-
   describe("Session State Machine", () => {
     // From working
     it("working + STOP → waiting (non-worktree)", () => {
@@ -466,438 +371,583 @@ describe("Session Tracking", () => {
     });
   });
 
-  describe("Signal Integration", () => {
-    let signalFile: (type: string, data: Record<string, unknown>) => string;
-    let cleanupFiles: string[];
-
-    beforeEach(async () => {
-      await mkdir(SIGNALS_DIR, { recursive: true });
-      cleanupFiles = [];
-      signalFile = (type: string, data: Record<string, unknown>) => {
-        const filepath = path.join(SIGNALS_DIR, `${TEST_SESSION_ID}.${type}.json`);
-        cleanupFiles.push(filepath);
-        return filepath;
+  describe("Hook → State Machine", () => {
+    let watcher: SessionWatcher;
+    let events: Array<{
+      type: string;
+      session: {
+        sessionId: string;
+        status: { status: string; hasPendingToolUse: boolean };
+        machineState: string;
+        activeTools: Array<{ toolUseId: string; toolName: string }>;
+        activeTasks: Array<{ toolUseId: string; description: string }>;
       };
-    });
+    }>;
 
-    afterEach(async () => {
-      for (const f of cleanupFiles) {
-        await rm(f, { force: true });
-      }
-    });
+    const HOOK_SESSION_ID = "test-hook-session";
+    const TRANSCRIPT_PATH = "/Users/test/.claude/projects/test/test.jsonl";
 
-    it("full lifecycle (non-worktree): working → waiting → idle", async () => {
-      const watcher = new SessionWatcher({ debounceMs: 50, permissionDelayMs: 1000 });
-      const statuses: string[] = [];
-      watcher.on("session", (event) => {
-        if (event.session.sessionId === TEST_SESSION_ID) {
-          statuses.push(event.session.status.status);
-        }
-      });
+    function makePayload(overrides: Partial<HookPayload> & Pick<HookPayload, "hook_event_name">): HookPayload {
+      return {
+        session_id: HOOK_SESSION_ID,
+        transcript_path: TRANSCRIPT_PATH,
+        cwd: "/Users/test/project",
+        ...overrides,
+      } as HookPayload;
+    }
 
-      await watcher.start();
+    async function seedSession(): Promise<void> {
+      await watcher.handleHook(makePayload({ hook_event_name: "UserPromptSubmit" }));
+    }
 
-      // 1. Create session → working
-      await writeFile(TEST_LOG_FILE, createUserEntry("hello"));
-      await new Promise((r) => setTimeout(r, 1000));
+    function lastEvent() {
+      return events[events.length - 1];
+    }
 
-      // 2. Stop signal → waiting
-      await writeFile(signalFile("stop", {}), JSON.stringify({
-        session_id: TEST_SESSION_ID,
-        stopped_at: new Date().toISOString(),
-      }));
-      await new Promise((r) => setTimeout(r, 500));
+    function lastStatus() {
+      return lastEvent()?.session.status;
+    }
 
-      // 3. Working signal → working again
-      await writeFile(signalFile("working", {}), JSON.stringify({
-        session_id: TEST_SESSION_ID,
-        working_since: new Date().toISOString(),
-      }));
-      await new Promise((r) => setTimeout(r, 500));
+    function lastMachineState() {
+      return lastEvent()?.session.machineState;
+    }
 
-      // 4. Ended signal → idle
-      await writeFile(signalFile("ended", {}), JSON.stringify({
-        session_id: TEST_SESSION_ID,
-        ended_at: new Date().toISOString(),
-      }));
-      await new Promise((r) => setTimeout(r, 500));
-
-      watcher.stop();
-      await new Promise((r) => setTimeout(r, 100));
-
-      expect(statuses).toContain("working");
-      expect(statuses).toContain("waiting");
-      expect(statuses[statuses.length - 1]).toBe("idle");
-    });
-
-    it("tool approval with debounce: working → needs_approval after delay", async () => {
-      const watcher = new SessionWatcher({ debounceMs: 50, permissionDelayMs: 500 });
-      const statuses: Array<{ status: string; hasPendingToolUse: boolean }> = [];
-      watcher.on("session", (event) => {
-        if (event.session.sessionId === TEST_SESSION_ID) {
-          statuses.push({
-            status: event.session.status.status,
-            hasPendingToolUse: event.session.status.hasPendingToolUse,
+    beforeEach(() => {
+      vi.useFakeTimers();
+      watcher = new SessionWatcher({ debounceMs: 50, permissionDelayMs: 3000 });
+      events = [];
+      watcher.on("session", (event: any) => {
+        if (event.session.sessionId === HOOK_SESSION_ID) {
+          events.push({
+            type: event.type,
+            session: {
+              sessionId: event.session.sessionId,
+              status: { ...event.session.status },
+              machineState: event.session.machineState,
+              activeTools: [...event.session.activeTools],
+              activeTasks: [...event.session.activeTasks],
+            },
           });
         }
       });
+    });
 
-      await watcher.start();
-
-      // 1. Create session → working
-      await writeFile(TEST_LOG_FILE, createUserEntry("run something"));
-      await new Promise((r) => setTimeout(r, 1000));
-
-      // 2. Permission signal → still working during debounce
-      await writeFile(signalFile("permission", {}), JSON.stringify({
-        session_id: TEST_SESSION_ID,
-        tool_name: "Bash",
-        pending_since: new Date().toISOString(),
-      }));
-      await new Promise((r) => setTimeout(r, 200));
-
-      // Should still be working (debounce not yet elapsed)
-      const duringDebounce = statuses[statuses.length - 1];
-      expect(duringDebounce.hasPendingToolUse).toBe(false);
-
-      // 3. Wait past debounce → needs_approval
-      await new Promise((r) => setTimeout(r, 800));
-
+    afterEach(() => {
       watcher.stop();
-      await new Promise((r) => setTimeout(r, 100));
+      vi.useRealTimers();
+    });
 
-      // Should have transitioned to waiting with hasPendingToolUse
-      const approvalEvents = statuses.filter(s => s.hasPendingToolUse);
+    // === Scenario 1: Simple text prompt (no tools) ===
+
+    it("UserPromptSubmit creates session in working state", async () => {
+      await seedSession();
+      expect(events[0].type).toBe("created");
+      expect(lastMachineState()).toBe("working");
+      expect(lastStatus().status).toBe("working");
+    });
+
+    it("Stop transitions to waiting", async () => {
+      await seedSession();
+      await watcher.handleHook(makePayload({ hook_event_name: "Stop" }));
+      expect(lastMachineState()).toBe("waiting");
+      expect(lastStatus().status).toBe("waiting");
+    });
+
+    it("SessionEnd transitions to idle", async () => {
+      await seedSession();
+      await watcher.handleHook(makePayload({ hook_event_name: "SessionEnd", reason: "other" }));
+      expect(lastMachineState()).toBe("idle");
+      expect(lastStatus().status).toBe("idle");
+    });
+
+    // === Scenario 2: Auto-approved tool (Read) ===
+
+    it("PreToolUse/Read adds to activeTools", async () => {
+      await seedSession();
+      await watcher.handleHook(makePayload({
+        hook_event_name: "PreToolUse",
+        tool_name: "Read",
+        tool_use_id: "toolu_read_01",
+        tool_input: { file_path: "/some/file.ts" },
+      }));
+      expect(lastEvent().session.activeTools).toContainEqual(
+        expect.objectContaining({ toolUseId: "toolu_read_01", toolName: "Read" })
+      );
+    });
+
+    it("PostToolUse/Read clears activeTools, still working (no PermissionRequest)", async () => {
+      await seedSession();
+      await watcher.handleHook(makePayload({
+        hook_event_name: "PreToolUse",
+        tool_name: "Read",
+        tool_use_id: "toolu_read_01",
+      }));
+      await watcher.handleHook(makePayload({
+        hook_event_name: "PostToolUse",
+        tool_name: "Read",
+        tool_use_id: "toolu_read_01",
+      }));
+      expect(lastEvent().session.activeTools).toHaveLength(0);
+      expect(lastMachineState()).toBe("working");
+    });
+
+    // === Scenario 3: Permission-requiring tool — APPROVED ===
+
+    it("PermissionRequest after debounce transitions to needs_approval", async () => {
+      await seedSession();
+      await watcher.handleHook(makePayload({
+        hook_event_name: "PreToolUse",
+        tool_name: "Bash",
+        tool_use_id: "toolu_bash_01",
+      }));
+      await watcher.handleHook(makePayload({
+        hook_event_name: "PermissionRequest",
+        tool_name: "Bash",
+        tool_use_id: "toolu_bash_01",
+      }));
+      // Before debounce — still working
+      expect(lastMachineState()).toBe("working");
+      // Advance past debounce
+      vi.advanceTimersByTime(3100);
+      expect(lastMachineState()).toBe("needs_approval");
+      expect(lastStatus().status).toBe("waiting");
+      expect(lastStatus().hasPendingToolUse).toBe(true);
+    });
+
+    it("PostToolUse/Bash after PermissionRequest clears permission, back to working", async () => {
+      await seedSession();
+      await watcher.handleHook(makePayload({
+        hook_event_name: "PreToolUse",
+        tool_name: "Bash",
+        tool_use_id: "toolu_bash_01",
+      }));
+      await watcher.handleHook(makePayload({
+        hook_event_name: "PermissionRequest",
+        tool_name: "Bash",
+        tool_use_id: "toolu_bash_01",
+      }));
+      vi.advanceTimersByTime(3100);
+      expect(lastMachineState()).toBe("needs_approval");
+      // User approves, PostToolUse fires
+      await watcher.handleHook(makePayload({
+        hook_event_name: "PostToolUse",
+        tool_name: "Bash",
+        tool_use_id: "toolu_bash_01",
+      }));
+      expect(lastMachineState()).toBe("working");
+      expect(lastStatus().hasPendingToolUse).toBe(false);
+    });
+
+    // === Scenario 4: Permission-requiring tool — DENIED ===
+
+    it("PostToolUseFailure clears permission, back to working", async () => {
+      await seedSession();
+      await watcher.handleHook(makePayload({
+        hook_event_name: "PreToolUse",
+        tool_name: "Read",
+        tool_use_id: "toolu_read_01",
+      }));
+      await watcher.handleHook(makePayload({
+        hook_event_name: "PermissionRequest",
+        tool_name: "Read",
+        tool_use_id: "toolu_read_01",
+      }));
+      vi.advanceTimersByTime(3100);
+      expect(lastMachineState()).toBe("needs_approval");
+      // User denies, PostToolUseFailure fires
+      await watcher.handleHook(makePayload({
+        hook_event_name: "PostToolUseFailure",
+        tool_name: "Read",
+        tool_use_id: "toolu_read_01",
+      }));
+      expect(lastMachineState()).toBe("working");
+      expect(lastStatus().hasPendingToolUse).toBe(false);
+    });
+
+    // === Scenario 6: AskUserQuestion (same as permission tool) ===
+
+    it("AskUserQuestion triggers PermissionRequest, PostToolUse clears it", async () => {
+      await seedSession();
+      await watcher.handleHook(makePayload({
+        hook_event_name: "PreToolUse",
+        tool_name: "AskUserQuestion",
+        tool_use_id: "toolu_ask_01",
+      }));
+      await watcher.handleHook(makePayload({
+        hook_event_name: "PermissionRequest",
+        tool_name: "AskUserQuestion",
+        tool_use_id: "toolu_ask_01",
+      }));
+      vi.advanceTimersByTime(3100);
+      expect(lastStatus().hasPendingToolUse).toBe(true);
+      await watcher.handleHook(makePayload({
+        hook_event_name: "PostToolUse",
+        tool_name: "AskUserQuestion",
+        tool_use_id: "toolu_ask_01",
+      }));
+      expect(lastMachineState()).toBe("working");
+      expect(lastStatus().hasPendingToolUse).toBe(false);
+    });
+
+    // === Scenario 7: Task tool (foreground subagent) ===
+
+    it("PreToolUse/Task adds to activeTasks, transitions to tasking", async () => {
+      await seedSession();
+      await watcher.handleHook(makePayload({
+        hook_event_name: "PreToolUse",
+        tool_name: "Task",
+        tool_use_id: "toolu_task_01",
+        tool_input: { subagent_type: "Bash", description: "Run tests" },
+      }));
+      expect(lastMachineState()).toBe("tasking");
+      expect(lastEvent().session.activeTasks).toContainEqual(
+        expect.objectContaining({ toolUseId: "toolu_task_01", description: "Run tests" })
+      );
+    });
+
+    it("PostToolUse/Task clears activeTasks, back to working", async () => {
+      await seedSession();
+      await watcher.handleHook(makePayload({
+        hook_event_name: "PreToolUse",
+        tool_name: "Task",
+        tool_use_id: "toolu_task_01",
+        tool_input: { subagent_type: "Bash", description: "Run tests" },
+      }));
+      await watcher.handleHook(makePayload({
+        hook_event_name: "PostToolUse",
+        tool_name: "Task",
+        tool_use_id: "toolu_task_01",
+      }));
+      expect(lastMachineState()).toBe("working");
+      expect(lastEvent().session.activeTasks).toHaveLength(0);
+    });
+
+    // === Scenario 9: PreCompact ===
+
+    it("PreCompact adds synthetic compacting task", async () => {
+      await seedSession();
+      await watcher.handleHook(makePayload({ hook_event_name: "PreCompact" }));
+      expect(lastEvent().session.activeTasks).toContainEqual(
+        expect.objectContaining({ toolUseId: "compacting", description: "Compacting context" })
+      );
+    });
+
+    // === Scenario 10: Background task ===
+
+    it("Background task: PostToolUse/Task fires immediately, clears task", async () => {
+      await seedSession();
+      await watcher.handleHook(makePayload({
+        hook_event_name: "PreToolUse",
+        tool_name: "Task",
+        tool_use_id: "toolu_bg_01",
+        tool_input: { subagent_type: "Bash", description: "Background work", run_in_background: true },
+      }));
+      expect(lastMachineState()).toBe("tasking");
+      // PostToolUse fires immediately (background task)
+      await watcher.handleHook(makePayload({
+        hook_event_name: "PostToolUse",
+        tool_name: "Task",
+        tool_use_id: "toolu_bg_01",
+      }));
+      expect(lastMachineState()).toBe("working");
+      expect(lastEvent().session.activeTasks).toHaveLength(0);
+    });
+
+    // === Permission debounce (verified in Scenarios 2-6) ===
+
+    it("PermissionRequest + PostToolUse within debounce → never shows needs_approval", async () => {
+      await seedSession();
+      await watcher.handleHook(makePayload({
+        hook_event_name: "PreToolUse",
+        tool_name: "EnterPlanMode",
+        tool_use_id: "toolu_plan_01",
+      }));
+      await watcher.handleHook(makePayload({
+        hook_event_name: "PermissionRequest",
+        tool_name: "EnterPlanMode",
+        tool_use_id: "toolu_plan_01",
+      }));
+      // Auto-approved: PostToolUse fires quickly (within debounce)
+      vi.advanceTimersByTime(500);
+      await watcher.handleHook(makePayload({
+        hook_event_name: "PostToolUse",
+        tool_name: "EnterPlanMode",
+        tool_use_id: "toolu_plan_01",
+      }));
+      // Advance past debounce window
+      vi.advanceTimersByTime(3000);
+      // Should never have shown needs_approval
+      const approvalEvents = events.filter(e => e.session.status.hasPendingToolUse);
+      expect(approvalEvents).toHaveLength(0);
+    });
+
+    it("PermissionRequest persists past debounce → shows needs_approval", async () => {
+      await seedSession();
+      await watcher.handleHook(makePayload({
+        hook_event_name: "PreToolUse",
+        tool_name: "Bash",
+        tool_use_id: "toolu_bash_01",
+      }));
+      await watcher.handleHook(makePayload({
+        hook_event_name: "PermissionRequest",
+        tool_name: "Bash",
+        tool_use_id: "toolu_bash_01",
+      }));
+      vi.advanceTimersByTime(3100);
+      const approvalEvents = events.filter(e => e.session.status.hasPendingToolUse);
       expect(approvalEvents.length).toBeGreaterThan(0);
     });
 
-    it("BUG FIX: review → working when session resumes (worktree)", async () => {
-      // This is the specific bug that was reported: session stuck in "review"
-      // after being resumed. The fix: review + WORKING → working.
+    // === Worktree behavior ===
 
-      // We simulate this by creating a worktree-like session.
-      // Since the watcher resolves isWorktree from the filesystem, we test
-      // the machine transition directly and verify via signal-driven status.
-      const watcher = new SessionWatcher({ debounceMs: 50, permissionDelayMs: 1000 });
-      const statuses: string[] = [];
-      watcher.on("session", (event) => {
-        if (event.session.sessionId === TEST_SESSION_ID) {
-          statuses.push(event.session.status.status);
-        }
-      });
-
-      await watcher.start();
-
-      // 1. Create session (initial state: waiting)
-      await writeFile(TEST_LOG_FILE, createUserEntry("initial task"));
-      await new Promise((r) => setTimeout(r, 1000));
-
-      // 2. Working signal → working (hooks are the only source of state transitions)
-      await writeFile(signalFile("working", {}), JSON.stringify({
-        session_id: TEST_SESSION_ID,
-        working_since: new Date().toISOString(),
-      }));
-      await new Promise((r) => setTimeout(r, 500));
-      expect(statuses).toContain("working");
-
-      // 3. Stop signal → waiting
-      await writeFile(signalFile("stop", {}), JSON.stringify({
-        session_id: TEST_SESSION_ID,
-        stopped_at: new Date().toISOString(),
-      }));
-      await new Promise((r) => setTimeout(r, 500));
-      expect(statuses).toContain("waiting");
-
-      // 4. Working signal again → working (this is the fix — should NOT stay stuck)
-      await writeFile(signalFile("working", {}), JSON.stringify({
-        session_id: TEST_SESSION_ID,
-        working_since: new Date().toISOString(),
-      }));
-      await new Promise((r) => setTimeout(r, 500));
-
-      watcher.stop();
-      await new Promise((r) => setTimeout(r, 100));
-
-      // The last status should be "working", not stuck in "waiting"
-      expect(statuses[statuses.length - 1]).toBe("working");
+    it("Stop on non-worktree session → waiting", async () => {
+      await seedSession();
+      await watcher.handleHook(makePayload({ hook_event_name: "Stop" }));
+      expect(lastMachineState()).toBe("waiting");
     });
 
-    it("JSONL changes do not cause state transitions", async () => {
-      const watcher = new SessionWatcher({ debounceMs: 50, permissionDelayMs: 1000 });
-      const statuses: Array<{ status: string; hasPendingToolUse: boolean }> = [];
-      watcher.on("session", (event) => {
-        if (event.session.sessionId === TEST_SESSION_ID) {
-          statuses.push({
-            status: event.session.status.status,
-            hasPendingToolUse: event.session.status.hasPendingToolUse,
-          });
-        }
-      });
-
-      await watcher.start();
-
-      // 1. Create session (initial state: waiting)
-      await writeFile(TEST_LOG_FILE, createUserEntry("help"));
-      await new Promise((r) => setTimeout(r, 1000));
-
-      // 2. Hook-driven: working signal → working
-      await writeFile(signalFile("working", {}), JSON.stringify({
-        session_id: TEST_SESSION_ID,
-        working_since: new Date().toISOString(),
-      }));
-      await new Promise((r) => setTimeout(r, 500));
-      expect(statuses[statuses.length - 1].status).toBe("working");
-
-      // 3. Append JSONL entries (assistant with tool_use, turn end) — should NOT change state
-      await appendFile(TEST_LOG_FILE, createAssistantEntry("running", new Date().toISOString(), true));
-      await new Promise((r) => setTimeout(r, 500));
-
-      const turnEnd = JSON.stringify({
-        type: "system",
-        subtype: "turn_duration",
-        timestamp: new Date().toISOString(),
-        duration_ms: 1000,
-        duration_api_ms: 900,
-      }) + "\n";
-      await appendFile(TEST_LOG_FILE, turnEnd);
-      await new Promise((r) => setTimeout(r, 500));
-
-      watcher.stop();
-      await new Promise((r) => setTimeout(r, 100));
-
-      // State should still be "working" — JSONL entries don't drive state transitions
-      expect(statuses[statuses.length - 1].status).toBe("working");
+    it("SessionEnd on non-worktree session → idle", async () => {
+      await seedSession();
+      await watcher.handleHook(makePayload({ hook_event_name: "SessionEnd" }));
+      expect(lastMachineState()).toBe("idle");
     });
 
-    it("task signal lifecycle: working → tasking → working", async () => {
-      const watcher = new SessionWatcher({ debounceMs: 50, permissionDelayMs: 1000 });
-      const statuses: string[] = [];
-      watcher.on("session", (event) => {
-        if (event.session.sessionId === TEST_SESSION_ID) {
-          statuses.push(event.session.status.status);
-        }
-      });
-
-      await watcher.start();
-
-      // 1. Create session (initial state: waiting), then working signal → working
-      await writeFile(TEST_LOG_FILE, createUserEntry("do some tasks"));
-      await new Promise((r) => setTimeout(r, 1000));
-      await writeFile(signalFile("working", {}), JSON.stringify({
-        session_id: TEST_SESSION_ID,
-        working_since: new Date().toISOString(),
-      }));
-      await new Promise((r) => setTimeout(r, 500));
-      expect(statuses).toContain("working");
-
-      // 2. Task signal → tasking
-      const taskFile1 = signalFile("task.toolu_001", {});
-      await writeFile(taskFile1, JSON.stringify({
-        session_id: TEST_SESSION_ID,
-        tool_use_id: "toolu_001",
-        agent_type: "Bash",
-        description: "Run tests",
-        started_at: new Date().toISOString(),
-      }));
-      await new Promise((r) => setTimeout(r, 500));
-      expect(statuses).toContain("tasking");
-
-      // 3. Second task signal → still tasking
-      const taskFile2 = signalFile("task.toolu_002", {});
-      await writeFile(taskFile2, JSON.stringify({
-        session_id: TEST_SESSION_ID,
-        tool_use_id: "toolu_002",
-        agent_type: "Explore",
-        description: "Search codebase",
-        started_at: new Date().toISOString(),
-      }));
-      await new Promise((r) => setTimeout(r, 500));
-
-      // 4. Remove first task → still tasking (one remains)
-      await rm(taskFile1, { force: true });
-      await new Promise((r) => setTimeout(r, 500));
-      expect(statuses[statuses.length - 1]).toBe("tasking");
-
-      // 5. Remove last task → working
-      await rm(taskFile2, { force: true });
-      await new Promise((r) => setTimeout(r, 500));
-      expect(statuses[statuses.length - 1]).toBe("working");
-
-      // 6. Stop signal → waiting
-      await writeFile(signalFile("stop", {}), JSON.stringify({
-        session_id: TEST_SESSION_ID,
-        stopped_at: new Date().toISOString(),
-      }));
-      await new Promise((r) => setTimeout(r, 500));
-
-      watcher.stop();
-      await new Promise((r) => setTimeout(r, 100));
-
-      expect(statuses[statuses.length - 1]).toBe("waiting");
+    it("UserPromptSubmit on waiting session → working", async () => {
+      await seedSession();
+      await watcher.handleHook(makePayload({ hook_event_name: "Stop" }));
+      expect(lastMachineState()).toBe("waiting");
+      await watcher.handleHook(makePayload({ hook_event_name: "UserPromptSubmit" }));
+      expect(lastMachineState()).toBe("working");
     });
 
-    it("PostToolUse clears permission — needs_approval → working", async () => {
-      const watcher = new SessionWatcher({ debounceMs: 50, permissionDelayMs: 500 });
-      const statuses: Array<{ status: string; hasPendingToolUse: boolean }> = [];
-      watcher.on("session", (event) => {
-        if (event.session.sessionId === TEST_SESSION_ID) {
-          statuses.push({
-            status: event.session.status.status,
-            hasPendingToolUse: event.session.status.hasPendingToolUse,
-          });
-        }
-      });
-
-      await watcher.start();
-
-      // 1. Create session → working
-      await writeFile(TEST_LOG_FILE, createUserEntry("run something"));
-      await new Promise((r) => setTimeout(r, 1000));
-
-      // 2. Working signal to ensure we're in working state
-      await writeFile(signalFile("working", {}), JSON.stringify({
-        session_id: TEST_SESSION_ID,
-        working_since: new Date().toISOString(),
-      }));
-      await new Promise((r) => setTimeout(r, 300));
-
-      // 3. Permission signal → needs_approval (after debounce)
-      const permFile = signalFile("permission", {});
-      await writeFile(permFile, JSON.stringify({
-        session_id: TEST_SESSION_ID,
-        tool_name: "Bash",
-        tool_input: { command: "rm -rf /" },
-        pending_since: new Date().toISOString(),
-      }));
-      await new Promise((r) => setTimeout(r, 800)); // past debounce
-
-      const afterPermission = statuses[statuses.length - 1];
-      expect(afterPermission.status).toBe("waiting");
-      expect(afterPermission.hasPendingToolUse).toBe(true);
-
-      // 4. Delete permission.json (simulates PostToolUse hook) → back to working
-      await rm(permFile, { force: true });
-      await new Promise((r) => setTimeout(r, 500));
-
-      watcher.stop();
-      await new Promise((r) => setTimeout(r, 100));
-
-      const final = statuses[statuses.length - 1];
-      expect(final.status).toBe("working");
-      expect(final.hasPendingToolUse).toBe(false);
+    it("UserPromptSubmit on idle session → working", async () => {
+      await seedSession();
+      await watcher.handleHook(makePayload({ hook_event_name: "SessionEnd" }));
+      expect(lastMachineState()).toBe("idle");
+      await watcher.handleHook(makePayload({ hook_event_name: "UserPromptSubmit" }));
+      expect(lastMachineState()).toBe("working");
     });
 
-    it("tool signal lifecycle — activeTools populated and cleared", async () => {
-      const watcher = new SessionWatcher({ debounceMs: 50, permissionDelayMs: 1000 });
-      const events: Array<{ activeTools: Array<{ toolUseId: string; toolName: string }> }> = [];
-      watcher.on("session", (event) => {
-        if (event.session.sessionId === TEST_SESSION_ID) {
-          events.push({
-            activeTools: event.session.activeTools.map((t: { toolUseId: string; toolName: string }) => ({
-              toolUseId: t.toolUseId,
-              toolName: t.toolName,
-            })),
-          });
-        }
-      });
+    // === Multi-tool / multi-task ===
 
-      await watcher.start();
-
-      // 1. Create session
-      await writeFile(TEST_LOG_FILE, createUserEntry("do something"));
-      await new Promise((r) => setTimeout(r, 1000));
-
-      // 2. Write tool signal
-      const toolFile = signalFile("tool.toolu_read_01", {});
-      await writeFile(toolFile, JSON.stringify({
-        session_id: TEST_SESSION_ID,
-        tool_use_id: "toolu_read_01",
+    it("Two concurrent tools → activeTools has 2 entries", async () => {
+      await seedSession();
+      await watcher.handleHook(makePayload({
+        hook_event_name: "PreToolUse",
         tool_name: "Read",
-        tool_input: { file_path: "/some/file.ts" },
-        started_at: new Date().toISOString(),
-      }));
-      await new Promise((r) => setTimeout(r, 500));
-
-      // Should have activeTools with our tool
-      const withTool = events[events.length - 1];
-      expect(withTool.activeTools).toContainEqual({
-        toolUseId: "toolu_read_01",
-        toolName: "Read",
-      });
-
-      // 3. Remove tool signal (simulates PostToolUse)
-      await rm(toolFile, { force: true });
-      await new Promise((r) => setTimeout(r, 500));
-
-      watcher.stop();
-      await new Promise((r) => setTimeout(r, 100));
-
-      // activeTools should be empty
-      const afterRemoval = events[events.length - 1];
-      expect(afterRemoval.activeTools).toHaveLength(0);
-    });
-
-    it("multiple concurrent tool signals", async () => {
-      const watcher = new SessionWatcher({ debounceMs: 50, permissionDelayMs: 1000 });
-      const events: Array<{ activeToolCount: number; toolNames: string[] }> = [];
-      watcher.on("session", (event) => {
-        if (event.session.sessionId === TEST_SESSION_ID) {
-          events.push({
-            activeToolCount: event.session.activeTools.length,
-            toolNames: event.session.activeTools.map((t: { toolName: string }) => t.toolName),
-          });
-        }
-      });
-
-      await watcher.start();
-
-      // 1. Create session
-      await writeFile(TEST_LOG_FILE, createUserEntry("multi-tool"));
-      await new Promise((r) => setTimeout(r, 1000));
-
-      // 2. Write two tool signals
-      const toolFile1 = signalFile("tool.toolu_01", {});
-      const toolFile2 = signalFile("tool.toolu_02", {});
-      await writeFile(toolFile1, JSON.stringify({
-        session_id: TEST_SESSION_ID,
         tool_use_id: "toolu_01",
-        tool_name: "Read",
-        tool_input: { file_path: "/a.ts" },
-        started_at: new Date().toISOString(),
       }));
-      await new Promise((r) => setTimeout(r, 300));
-      await writeFile(toolFile2, JSON.stringify({
-        session_id: TEST_SESSION_ID,
-        tool_use_id: "toolu_02",
+      await watcher.handleHook(makePayload({
+        hook_event_name: "PreToolUse",
         tool_name: "Grep",
-        tool_input: { pattern: "foo" },
-        started_at: new Date().toISOString(),
+        tool_use_id: "toolu_02",
       }));
-      await new Promise((r) => setTimeout(r, 500));
+      expect(lastEvent().session.activeTools).toHaveLength(2);
+    });
 
-      // Should have 2 active tools
-      const withBoth = events[events.length - 1];
-      expect(withBoth.activeToolCount).toBe(2);
-      expect(withBoth.toolNames).toContain("Read");
-      expect(withBoth.toolNames).toContain("Grep");
+    it("Two concurrent tasks → tasking with 2 activeTasks", async () => {
+      await seedSession();
+      await watcher.handleHook(makePayload({
+        hook_event_name: "PreToolUse",
+        tool_name: "Task",
+        tool_use_id: "toolu_task_01",
+        tool_input: { subagent_type: "Bash", description: "Task 1" },
+      }));
+      await watcher.handleHook(makePayload({
+        hook_event_name: "PreToolUse",
+        tool_name: "Task",
+        tool_use_id: "toolu_task_02",
+        tool_input: { subagent_type: "Explore", description: "Task 2" },
+      }));
+      expect(lastMachineState()).toBe("tasking");
+      expect(lastEvent().session.activeTasks).toHaveLength(2);
+    });
 
-      // 3. Remove one → only one remains
-      await rm(toolFile1, { force: true });
-      await new Promise((r) => setTimeout(r, 500));
+    it("Remove one of two tasks → still tasking", async () => {
+      await seedSession();
+      await watcher.handleHook(makePayload({
+        hook_event_name: "PreToolUse",
+        tool_name: "Task",
+        tool_use_id: "toolu_task_01",
+        tool_input: { subagent_type: "Bash", description: "Task 1" },
+      }));
+      await watcher.handleHook(makePayload({
+        hook_event_name: "PreToolUse",
+        tool_name: "Task",
+        tool_use_id: "toolu_task_02",
+        tool_input: { subagent_type: "Explore", description: "Task 2" },
+      }));
+      await watcher.handleHook(makePayload({
+        hook_event_name: "PostToolUse",
+        tool_name: "Task",
+        tool_use_id: "toolu_task_01",
+      }));
+      expect(lastMachineState()).toBe("tasking");
+      expect(lastEvent().session.activeTasks).toHaveLength(1);
+    });
 
-      const withOne = events[events.length - 1];
-      expect(withOne.activeToolCount).toBe(1);
-      expect(withOne.toolNames).toContain("Grep");
+    it("Remove last task → working", async () => {
+      await seedSession();
+      await watcher.handleHook(makePayload({
+        hook_event_name: "PreToolUse",
+        tool_name: "Task",
+        tool_use_id: "toolu_task_01",
+        tool_input: { subagent_type: "Bash", description: "Task 1" },
+      }));
+      await watcher.handleHook(makePayload({
+        hook_event_name: "PreToolUse",
+        tool_name: "Task",
+        tool_use_id: "toolu_task_02",
+        tool_input: { subagent_type: "Explore", description: "Task 2" },
+      }));
+      await watcher.handleHook(makePayload({
+        hook_event_name: "PostToolUse",
+        tool_name: "Task",
+        tool_use_id: "toolu_task_01",
+      }));
+      await watcher.handleHook(makePayload({
+        hook_event_name: "PostToolUse",
+        tool_name: "Task",
+        tool_use_id: "toolu_task_02",
+      }));
+      expect(lastMachineState()).toBe("working");
+      expect(lastEvent().session.activeTasks).toHaveLength(0);
+    });
 
-      // 4. Remove the other → empty
-      await rm(toolFile2, { force: true });
-      await new Promise((r) => setTimeout(r, 500));
+    // === Full lifecycle (Scenario 1 + 3 combined) ===
 
+    it("Full lifecycle: UserPromptSubmit → PreToolUse → PermissionRequest → PostToolUse → Stop → SessionEnd", async () => {
+      await seedSession();
+      expect(lastMachineState()).toBe("working");
+
+      // Tool with permission
+      await watcher.handleHook(makePayload({
+        hook_event_name: "PreToolUse",
+        tool_name: "Bash",
+        tool_use_id: "toolu_bash_01",
+      }));
+      await watcher.handleHook(makePayload({
+        hook_event_name: "PermissionRequest",
+        tool_name: "Bash",
+      }));
+      vi.advanceTimersByTime(3100);
+      expect(lastMachineState()).toBe("needs_approval");
+
+      await watcher.handleHook(makePayload({
+        hook_event_name: "PostToolUse",
+        tool_name: "Bash",
+        tool_use_id: "toolu_bash_01",
+      }));
+      expect(lastMachineState()).toBe("working");
+
+      // Stop → waiting
+      await watcher.handleHook(makePayload({ hook_event_name: "Stop" }));
+      expect(lastMachineState()).toBe("waiting");
+
+      // SessionEnd from waiting is a no-op (already done).
+      // To reach idle, SessionEnd must fire from working/tasking directly.
+      await watcher.handleHook(makePayload({ hook_event_name: "SessionEnd" }));
+      expect(lastMachineState()).toBe("waiting");
+
+      // Restart and go directly to idle via SessionEnd from working
+      await watcher.handleHook(makePayload({ hook_event_name: "UserPromptSubmit" }));
+      expect(lastMachineState()).toBe("working");
+      await watcher.handleHook(makePayload({ hook_event_name: "SessionEnd" }));
+      expect(lastMachineState()).toBe("idle");
+    });
+
+    // === Stop clears compacting ===
+
+    it("Stop clears compacting signal", async () => {
+      await seedSession();
+      await watcher.handleHook(makePayload({ hook_event_name: "PreCompact" }));
+      expect(lastEvent().session.activeTasks.some(t => t.toolUseId === "compacting")).toBe(true);
+      await watcher.handleHook(makePayload({ hook_event_name: "Stop" }));
+      expect(lastEvent().session.activeTasks.some(t => t.toolUseId === "compacting")).toBe(false);
+    });
+  });
+
+  describe("POST /hook endpoint", () => {
+    // Mock HTTP request/response for handleHookRequest
+    function mockReq(body: string) {
+      const s = new Readable({ read() {} });
+      s.push(Buffer.from(body));
+      s.push(null);
+      return s as any;
+    }
+
+    function mockRes() {
+      const r = {
+        statusCode: 0,
+        body: "",
+        headers: {} as Record<string, string>,
+        writeHead(code: number, headers?: Record<string, string>) {
+          r.statusCode = code;
+          if (headers) Object.assign(r.headers, headers);
+        },
+        end(body?: string) { r.body = body ?? ""; },
+      };
+      return r as any;
+    }
+
+    it("returns 200 for valid hook payload", async () => {
+      const watcher = new SessionWatcher({ debounceMs: 50 });
+      const req = mockReq(JSON.stringify({
+        hook_event_name: "UserPromptSubmit",
+        session_id: "test-endpoint-session",
+        cwd: "/tmp",
+      }));
+      const res = mockRes();
+      await handleHookRequest(req, res, watcher);
+      expect(res.statusCode).toBe(200);
+      expect(JSON.parse(res.body).ok).toBe(true);
       watcher.stop();
-      await new Promise((r) => setTimeout(r, 100));
+    });
 
-      const empty = events[events.length - 1];
-      expect(empty.activeToolCount).toBe(0);
+    it("returns 400 for missing hook_event_name", async () => {
+      const watcher = new SessionWatcher({ debounceMs: 50 });
+      const req = mockReq(JSON.stringify({ session_id: "test" }));
+      const res = mockRes();
+      await handleHookRequest(req, res, watcher);
+      expect(res.statusCode).toBe(400);
+      watcher.stop();
+    });
+
+    it("returns 400 for missing session_id", async () => {
+      const watcher = new SessionWatcher({ debounceMs: 50 });
+      const req = mockReq(JSON.stringify({ hook_event_name: "Stop" }));
+      const res = mockRes();
+      await handleHookRequest(req, res, watcher);
+      expect(res.statusCode).toBe(400);
+      watcher.stop();
+    });
+
+    it("returns 400 for invalid JSON", async () => {
+      const watcher = new SessionWatcher({ debounceMs: 50 });
+      const req = mockReq("not json at all");
+      const res = mockRes();
+      await handleHookRequest(req, res, watcher);
+      expect(res.statusCode).toBe(400);
+      expect(JSON.parse(res.body).error).toBe("Invalid JSON");
+      watcher.stop();
+    });
+
+    it("watcher receives hook and emits correct session event", async () => {
+      const watcher = new SessionWatcher({ debounceMs: 50 });
+      const created: string[] = [];
+      watcher.on("session", (event: any) => {
+        if (event.type === "created") created.push(event.session.sessionId);
+      });
+      const req = mockReq(JSON.stringify({
+        hook_event_name: "UserPromptSubmit",
+        session_id: "test-emit-session",
+        cwd: "/tmp",
+      }));
+      const res = mockRes();
+      await handleHookRequest(req, res, watcher);
+      expect(res.statusCode).toBe(200);
+      expect(created).toContain("test-emit-session");
+      watcher.stop();
     });
   });
 

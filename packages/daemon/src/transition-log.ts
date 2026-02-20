@@ -27,7 +27,9 @@ export interface TransitionMeta {
 }
 
 export interface HookEventMeta {
+  hook?: string;
   signal?: string;
+  source?: string;
   tool?: string;
   agent?: string;
   desc?: string;
@@ -94,6 +96,8 @@ function formatHookLine(hookName: string, meta?: HookEventMeta): string {
   const stateCol = `[hook] ${hookName}`;
 
   const parts: string[] = [];
+  if (meta?.hook) parts.push(`hook:${meta.hook}`);
+  if (meta?.source) parts.push(`source:${meta.source}`);
   if (meta?.tool) parts.push(`tool:${meta.tool}`);
   if (meta?.agent) parts.push(`agent:${meta.agent}`);
   if (meta?.desc) parts.push(`desc:${meta.desc}`);

@@ -1,14 +1,9 @@
 #!/bin/bash
 # Setup script for claude-code-ui daemon hooks
-# Installs hooks for accurate session state detection:
-# - UserPromptSubmit: detect when user starts a turn (working)
-# - PermissionRequest: detect when waiting for user approval
-# - PreToolUse (all): track active tools + subagent spawns
-# - PostToolUse (all): clear tool/permission signals on completion
-# - PostToolUseFailure (all): clear tool/permission signals on failure/denial
-# - Stop: detect when Claude finishes responding (waiting)
-# - SessionEnd: detect when session closes (idle)
-# - PreCompact: detect context compaction
+#
+# Registers a single hook script (forward-hook.sh) for all 8 hook events.
+# The script forwards the raw hook payload to the daemon via HTTP POST.
+# The daemon handles all state transitions internally.
 
 set -e
 
@@ -41,13 +36,8 @@ if [[ "$OSTYPE" == msys* || "$OSTYPE" == cygwin* || "$OSTYPE" == mingw* ]]; then
 fi
 
 SETTINGS_FILE="$HOME/.claude/settings.json"
-SIGNALS_DIR="$HOME/.claude/session-signals"
 
 echo "Setting up claude-code-ui hooks..."
-
-# Create signals directory
-mkdir -p "$SIGNALS_DIR"
-echo "Created $SIGNALS_DIR"
 
 # Check if jq is installed
 if ! command -v jq &> /dev/null; then
@@ -102,15 +92,28 @@ remove_hook() {
   mv "$SETTINGS_FILE.tmp" "$SETTINGS_FILE"
 }
 
-# Production hooks
-upsert_hook "UserPromptSubmit" "" "$SCRIPT_DIR/hooks/user-prompt-submit.sh"
-upsert_hook "PermissionRequest" "" "$SCRIPT_DIR/hooks/permission-request.sh"
-upsert_hook "PreToolUse" "" "$SCRIPT_DIR/hooks/pre-tool-use-all.sh"
-upsert_hook "PostToolUse" "" "$SCRIPT_DIR/hooks/post-tool-use.sh"
-upsert_hook "PostToolUseFailure" "" "$SCRIPT_DIR/hooks/post-tool-use-failure.sh"
-upsert_hook "Stop" "" "$SCRIPT_DIR/hooks/stop.sh"
-upsert_hook "SessionEnd" "" "$SCRIPT_DIR/hooks/session-end.sh"
-upsert_hook "PreCompact" "" "$SCRIPT_DIR/hooks/compact-start.sh"
+# Remove old individual hook scripts (replaced by forward-hook.sh)
+OLD_SCRIPTS=(
+  "user-prompt-submit.sh" "permission-request.sh" "pre-tool-use-all.sh"
+  "post-tool-use.sh" "post-tool-use-failure.sh" "stop.sh" "session-end.sh"
+  "compact-start.sh"
+)
+HOOK_TYPES=(
+  "UserPromptSubmit" "PermissionRequest" "PreToolUse"
+  "PostToolUse" "PostToolUseFailure" "Stop" "SessionEnd" "PreCompact"
+)
+
+for old_script in "${OLD_SCRIPTS[@]}"; do
+  for hook_type in "${HOOK_TYPES[@]}"; do
+    remove_hook "$hook_type" "$old_script"
+  done
+done
+
+# Register forward-hook.sh for all 8 hook events
+FORWARD_HOOK="$SCRIPT_DIR/hooks/forward-hook.sh"
+for hook_type in "${HOOK_TYPES[@]}"; do
+  upsert_hook "$hook_type" "" "$FORWARD_HOOK"
+done
 
 # Debug hooks: install or remove based on --debug flag
 DEBUG_HOOK_SCRIPT="debug-hook.sh"
@@ -136,16 +139,11 @@ fi
 
 echo ""
 echo "Installed hooks to $SETTINGS_FILE:"
-echo "  - UserPromptSubmit (detect turn started → working)"
-echo "  - PermissionRequest (detect approval needed)"
-echo "  - PreToolUse (track active tools + subagent spawns)"
-echo "  - PostToolUse (clear tool/permission on completion)"
-echo "  - PostToolUseFailure (clear tool/permission on failure/denial)"
-echo "  - Stop (detect turn ended → waiting)"
-echo "  - SessionEnd (detect session closed → idle)"
-echo "  - PreCompact (detect context compaction)"
+echo "  All 8 hook events → forward-hook.sh → HTTP POST to daemon"
+echo "  (UserPromptSubmit, PermissionRequest, PreToolUse, PostToolUse,"
+echo "   PostToolUseFailure, Stop, SessionEnd, PreCompact)"
 if [ "$DEBUG_HOOKS" = true ]; then
-  echo "  - Debug: all 14 hook events logged to hook-debug.log"
+  echo "  + Debug: all 14 hook events logged to hook-debug.log"
 fi
 echo ""
 echo "Setup complete! The daemon will now accurately track session states."

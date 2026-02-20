@@ -1,7 +1,6 @@
 import { watch, type FSWatcher } from "chokidar";
 import { EventEmitter } from "node:events";
-import { readFile, unlink, readdir, access, constants } from "node:fs/promises";
-import { join } from "node:path";
+import { access, constants } from "node:fs/promises";
 import {
   tailJSONL,
   extractMetadata,
@@ -20,9 +19,9 @@ import { getGitInfoCached, type GitInfo } from "./git.js";
 import type { LogEntry, SessionMetadata, StatusResult } from "./types.js";
 import { log } from "./log.js";
 import { appendTransition, appendHookEvent, type TransitionMeta } from "./transition-log.js";
+import type { HookPayload } from "./hook-handler.js";
 
 const CLAUDE_PROJECTS_DIR = `${process.env.HOME}/.claude/projects`;
-const SIGNALS_DIR = `${process.env.HOME}/.claude/session-signals`;
 
 export interface PendingPermission {
   session_id: string;
@@ -31,32 +30,11 @@ export interface PendingPermission {
   pending_since: string;
 }
 
-export interface TaskSignal {
-  session_id: string;
-  tool_use_id: string;
-  agent_type: string;
-  description: string;
-  started_at: string;
-}
-
-export interface CompactingSignal {
-  session_id: string;
-  started_at: string;
-}
-
 export interface ActiveTask {
   toolUseId: string;
   agentType: string;
   description: string;
   startedAt: string;
-}
-
-export interface ToolSignal {
-  session_id: string;
-  tool_use_id: string;
-  tool_name: string;
-  tool_input: Record<string, unknown>;
-  started_at: string;
 }
 
 export interface ActiveTool {
@@ -110,12 +88,10 @@ export interface SessionEvent {
 
 export class SessionWatcher extends EventEmitter {
   private watcher: FSWatcher | null = null;
-  private signalWatcher: FSWatcher | null = null;
   private sessions = new Map<string, SessionState>();
   private taskSignals = new Map<string, Map<string, ActiveTask>>(); // sessionId → toolUseId → ActiveTask
   private toolSignals = new Map<string, Map<string, ActiveTool>>(); // sessionId → toolUseId → ActiveTool
   private compactingSignals = new Map<string, string>(); // sessionId → startedAt
-  private loggedHooks = new Set<string>(); // dedup keys for hook event logging
   private debounceTimers = new Map<string, NodeJS.Timeout>();
   private permissionTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private debounceMs: number;
@@ -133,17 +109,6 @@ export class SessionWatcher extends EventEmitter {
    */
   getPendingPermission(sessionId: string): PendingPermission | undefined {
     return this.sessions.get(sessionId)?.pendingPermission;
-  }
-
-  /**
-   * Log a hook event, deduplicating by key.
-   * Returns true if the event was logged (new), false if it was a duplicate.
-   */
-  private logHook(dedupKey: string, sessionId: string, hookName: string, meta?: Parameters<typeof appendHookEvent>[2]): boolean {
-    if (this.loggedHooks.has(dedupKey)) return false;
-    this.loggedHooks.add(dedupKey);
-    appendHookEvent(sessionId, hookName, meta);
-    return true;
   }
 
   /**
@@ -167,13 +132,6 @@ export class SessionWatcher extends EventEmitter {
     }
     if (prevState === "needs_approval" && nextState !== "needs_approval") {
       session.pendingPermission = undefined;
-      this.cleanupSignalFile(sessionId, "permission");
-    }
-
-    // On-enter side effects
-    if ((nextState === "working" || nextState === "tasking") && (prevState === "review" || prevState === "waiting" || prevState === "idle")) {
-      this.cleanupSignalFile(sessionId, "stop");
-      this.cleanupSignalFile(sessionId, "ended");
     }
 
     // Update state
@@ -193,15 +151,255 @@ export class SessionWatcher extends EventEmitter {
   }
 
   /**
-   * Best-effort cleanup of a signal file.
+   * Handle an incoming hook event forwarded from Claude Code via HTTP POST.
+   * This is the single entry point for all hook-driven state transitions.
    */
-  private cleanupSignalFile(sessionId: string, type: string): void {
-    unlink(join(SIGNALS_DIR, `${sessionId}.${type}.json`)).catch(() => {});
+  async handleHook(payload: HookPayload): Promise<void> {
+    const { hook_event_name, session_id: sessionId } = payload;
+    const now = new Date().toISOString();
+
+    switch (hook_event_name) {
+      case "UserPromptSubmit": {
+        log("Watcher", `Hook UserPromptSubmit for session ${sessionId}`);
+        appendHookEvent(sessionId, "UserPromptSubmit", { hook: "UserPromptSubmit" });
+
+        // If the session doesn't exist yet (JSONL watcher hasn't created it),
+        // create it directly from the hook payload. Hooks are authoritative.
+        if (!this.sessions.has(sessionId)) {
+          const transcriptPath = (payload.transcript_path ?? "").replace(/\\/g, "/");
+          const cwd = payload.cwd ?? "";
+          const gitInfo = await getGitInfoCached(cwd);
+          const published = machineStateToPublishedStatus("working");
+
+          const session: SessionState = {
+            sessionId,
+            filepath: transcriptPath,
+            encodedDir: extractEncodedDir(transcriptPath),
+            cwd,
+            gitBranch: gitInfo.branch,
+            originalPrompt: (payload.prompt as string) ?? "",
+            startedAt: now,
+            status: {
+              status: published.status,
+              hasPendingToolUse: published.hasPendingToolUse,
+              lastRole: "assistant",
+              lastActivityAt: now,
+              messageCount: 0,
+            },
+            entries: [],
+            bytePosition: 0,
+            gitRepoUrl: gitInfo.repoUrl,
+            gitRepoId: gitInfo.repoId,
+            gitRootPath: gitInfo.rootPath,
+            isWorktree: gitInfo.isWorktree,
+            worktreePath: gitInfo.worktreePath,
+            machineState: "working",
+            activeTasks: this.getActiveTasksForSession(sessionId),
+            activeTools: this.getActiveToolsForSession(sessionId),
+            todoProgress: null,
+          };
+
+          this.sessions.set(sessionId, session);
+          appendTransition(sessionId, null, "working", { event: "WORKING", source: "hook", signal: "http:UserPromptSubmit" });
+          this.emit("session", { type: "created", session } satisfies SessionEvent);
+          log("Watcher", `Created session ${sessionId} from UserPromptSubmit hook`);
+        } else {
+          this.transitionSession(sessionId, { type: "WORKING" }, { event: "WORKING", source: "hook", signal: "http:UserPromptSubmit" });
+        }
+        break;
+      }
+
+      case "PermissionRequest": {
+        const toolName = payload.tool_name ?? "unknown";
+        log("Watcher", `Hook PermissionRequest for session ${sessionId}: ${toolName}`);
+        appendHookEvent(sessionId, "PermissionRequest", { tool: toolName, hook: "PermissionRequest" });
+
+        // Cancel any existing debounce timer
+        const existingTimer = this.permissionTimers.get(sessionId);
+        if (existingTimer) clearTimeout(existingTimer);
+
+        // Debounce: only send PERMISSION_REQUEST after delay.
+        // Auto-approved tools fire PostToolUse quickly, which cancels the timer.
+        const permission: PendingPermission = {
+          session_id: sessionId,
+          tool_name: toolName,
+          tool_input: payload.tool_input,
+          pending_since: now,
+        };
+        this.permissionTimers.set(sessionId, setTimeout(() => {
+          this.permissionTimers.delete(sessionId);
+          const s = this.sessions.get(sessionId);
+          if (s) s.pendingPermission = permission;
+          this.transitionSession(sessionId, { type: "PERMISSION_REQUEST" }, { event: "PERMISSION_REQUEST", source: "hook", signal: "http:PermissionRequest", tool: toolName });
+        }, this.permissionDelayMs));
+        break;
+      }
+
+      case "PreToolUse": {
+        const toolName = payload.tool_name ?? "unknown";
+        const toolUseId = payload.tool_use_id ?? "";
+        log("Watcher", `Hook PreToolUse for session ${sessionId}: ${toolName} (${toolUseId})`);
+        appendHookEvent(sessionId, "PreToolUse", { tool: toolName, id: toolUseId, hook: "PreToolUse" });
+
+        if (toolUseId) {
+          // Track active tool
+          let sessionTools = this.toolSignals.get(sessionId);
+          if (!sessionTools) {
+            sessionTools = new Map();
+            this.toolSignals.set(sessionId, sessionTools);
+          }
+          sessionTools.set(toolUseId, {
+            toolUseId,
+            toolName,
+            toolInput: payload.tool_input ?? {},
+            startedAt: now,
+          });
+
+          const session = this.sessions.get(sessionId);
+          if (session) {
+            session.activeTools = this.getActiveToolsForSession(sessionId);
+            this.emit("session", { type: "updated", session } satisfies SessionEvent);
+          }
+
+          // If this is a Task tool, also track as active task
+          if (toolName === "Task") {
+            let sessionTasks = this.taskSignals.get(sessionId);
+            if (!sessionTasks) {
+              sessionTasks = new Map();
+              this.taskSignals.set(sessionId, sessionTasks);
+            }
+            sessionTasks.set(toolUseId, {
+              toolUseId,
+              agentType: (payload.tool_input?.subagent_type as string) ?? "unknown",
+              description: (payload.tool_input?.description as string) ?? "task",
+              startedAt: now,
+            });
+
+            if (session) {
+              session.activeTasks = this.getActiveTasksForSession(sessionId);
+              appendHookEvent(sessionId, "task_start", {
+                agent: (payload.tool_input?.subagent_type as string) ?? "unknown",
+                desc: (payload.tool_input?.description as string) ?? "",
+                id: toolUseId,
+                hook: "PreToolUse/Task",
+              });
+              // Fire TASK_STARTED to transition working → tasking
+              if (!this.transitionSession(sessionId, { type: "TASK_STARTED" }, { event: "TASK_STARTED", source: "hook", signal: `http:PreToolUse/Task(${toolUseId})` })) {
+                this.emit("session", { type: "updated", session } satisfies SessionEvent);
+              }
+            }
+          }
+        }
+        break;
+      }
+
+      case "PostToolUse":
+      case "PostToolUseFailure": {
+        const toolName = payload.tool_name ?? "unknown";
+        const toolUseId = payload.tool_use_id ?? "";
+        log("Watcher", `Hook ${hook_event_name} for session ${sessionId}: ${toolName} (${toolUseId})`);
+        appendHookEvent(sessionId, hook_event_name, { tool: toolName, id: toolUseId, hook: hook_event_name });
+
+        // Clear permission debounce timer — tool completed (auto-approved or user-approved)
+        const timer = this.permissionTimers.get(sessionId);
+        if (timer) { clearTimeout(timer); this.permissionTimers.delete(sessionId); }
+
+        // If in needs_approval, transition back to working
+        const session = this.sessions.get(sessionId);
+        if (session?.machineState === "needs_approval") {
+          this.transitionSession(sessionId, { type: "WORKING" },
+            { event: "WORKING", source: "hook", signal: `http:${hook_event_name}` });
+        }
+
+        // Remove active tool
+        if (toolUseId) {
+          const sessionTools = this.toolSignals.get(sessionId);
+          if (sessionTools) {
+            const removedTool = sessionTools.get(toolUseId);
+            appendHookEvent(sessionId, "tool_end", { tool: removedTool?.toolName, id: toolUseId, hook: hook_event_name });
+            sessionTools.delete(toolUseId);
+            if (sessionTools.size === 0) this.toolSignals.delete(sessionId);
+          }
+          if (session) {
+            session.activeTools = this.getActiveToolsForSession(sessionId);
+            this.emit("session", { type: "updated", session } satisfies SessionEvent);
+          }
+
+          // If this was a Task tool, also remove active task
+          if (toolName === "Task") {
+            const sessionTasks = this.taskSignals.get(sessionId);
+            if (sessionTasks) {
+              const removedTask = sessionTasks.get(toolUseId);
+              appendHookEvent(sessionId, "task_end", { agent: removedTask?.agentType, id: toolUseId, hook: hook_event_name });
+              sessionTasks.delete(toolUseId);
+              if (sessionTasks.size === 0) this.taskSignals.delete(sessionId);
+            }
+            if (session) {
+              session.activeTasks = this.getActiveTasksForSession(sessionId);
+              if (session.activeTasks.length === 0) {
+                if (!this.transitionSession(sessionId, { type: "TASKS_DONE" }, { event: "TASKS_DONE", source: "hook", signal: `http:${hook_event_name}/Task(${toolUseId})` })) {
+                  this.emit("session", { type: "updated", session } satisfies SessionEvent);
+                }
+              } else {
+                this.emit("session", { type: "updated", session } satisfies SessionEvent);
+              }
+            }
+          }
+        }
+        break;
+      }
+
+      case "Stop": {
+        log("Watcher", `Hook Stop for session ${sessionId}`);
+        appendHookEvent(sessionId, "Stop", { hook: "Stop" });
+
+        // Clear permission debounce timer
+        const permTimer = this.permissionTimers.get(sessionId);
+        if (permTimer) { clearTimeout(permTimer); this.permissionTimers.delete(sessionId); }
+
+        // Clear compacting signal
+        if (this.compactingSignals.has(sessionId)) {
+          this.compactingSignals.delete(sessionId);
+          appendHookEvent(sessionId, "compacting_end", { hook: "Stop" });
+          const session = this.sessions.get(sessionId);
+          if (session) {
+            session.activeTasks = this.getActiveTasksForSession(sessionId);
+          }
+        }
+
+        this.transitionSession(sessionId, { type: "STOP" }, { event: "STOP", source: "hook", signal: "http:Stop" });
+        break;
+      }
+
+      case "SessionEnd": {
+        log("Watcher", `Hook SessionEnd for session ${sessionId}`);
+        appendHookEvent(sessionId, "SessionEnd", { reason: payload.reason, hook: "SessionEnd" });
+
+        // Clear permission debounce timer
+        const permTimer = this.permissionTimers.get(sessionId);
+        if (permTimer) { clearTimeout(permTimer); this.permissionTimers.delete(sessionId); }
+
+        this.transitionSession(sessionId, { type: "ENDED" }, { event: "ENDED", source: "hook", signal: "http:SessionEnd" });
+        break;
+      }
+
+      case "PreCompact": {
+        log("Watcher", `Hook PreCompact for session ${sessionId}`);
+        appendHookEvent(sessionId, "PreCompact", { hook: "PreCompact" });
+        this.compactingSignals.set(sessionId, now);
+
+        const session = this.sessions.get(sessionId);
+        if (session) {
+          session.activeTasks = this.getActiveTasksForSession(sessionId);
+          this.emit("session", { type: "updated", session } satisfies SessionEvent);
+        }
+        break;
+      }
+    }
   }
 
   async start(): Promise<void> {
-    // Use directory watching instead of glob - chokidar has issues with
-    // directories that start with dashes when using glob patterns
+    // Watch JSONL files in ~/.claude/projects/ for session content
     this.watcher = watch(CLAUDE_PROJECTS_DIR, {
       ignored: /agent-.*\.jsonl$/,  // Ignore agent sub-session files
       persistent: true,
@@ -222,203 +420,45 @@ export class SessionWatcher extends EventEmitter {
       .on("unlink", (path) => this.handleDelete(path))
       .on("error", (error) => this.emit("error", error));
 
-    // Watch signals directory for hook output (permission, stop, session-end)
-    this.signalWatcher = watch(SIGNALS_DIR, {
-      persistent: true,
-      ignoreInitial: false,
-      depth: 0,
-    });
-
-    this.signalWatcher
-      .on("add", (path) => {
-        if (!path.endsWith(".json")) return;
-        this.handleSignalFile(path);
-      })
-      .on("change", (path) => {
-        if (!path.endsWith(".json")) return;
-        this.handleSignalFile(path);
-      })
-      .on("unlink", (path) => {
-        if (!path.endsWith(".json")) return;
-        this.handleSignalRemoved(path);
-      })
-      .on("error", () => {
-        // Ignore errors - directory may not exist if hooks aren't set up
-      });
-
     // Wait for initial scan to complete
     await new Promise<void>((resolve) => {
       this.watcher!.on("ready", resolve);
     });
 
-    // Load any existing signal files
-    await this.loadExistingSignals();
-
     // Start periodic stale check to detect sessions that have gone idle
-    // This catches cases where the turn ends but no turn_duration event is written
+    // This catches cases where the turn ends but no hook fires
     this.staleCheckInterval = setInterval(() => {
       this.checkStaleSessions();
     }, 10_000); // Check every 10 seconds
   }
 
-  /**
-   * Load any existing signal files on startup.
-   */
-  private async loadExistingSignals(): Promise<void> {
-    try {
-      const files = await readdir(SIGNALS_DIR);
-      for (const file of files) {
-        if (file.endsWith(".json")) {
-          await this.handleSignalFile(join(SIGNALS_DIR, file));
-        }
-      }
-    } catch {
-      // Directory doesn't exist or can't be read - that's fine
+  stop(): void {
+    if (this.watcher) {
+      this.watcher.close();
+      this.watcher = null;
     }
+
+    // Clear stale check interval
+    if (this.staleCheckInterval) {
+      clearInterval(this.staleCheckInterval);
+      this.staleCheckInterval = null;
+    }
+
+    // Clear all debounce timers
+    for (const timer of this.debounceTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.debounceTimers.clear();
+
+    // Clear all permission debounce timers
+    for (const timer of this.permissionTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.permissionTimers.clear();
   }
 
-  /**
-   * Parse signal filename to extract session ID and signal type.
-   * Formats:
-   *   <session_id>.<type>.json (e.g., abc123.permission.json)
-   *   <session_id>.tool.<tool_use_id>.json (e.g., abc123.tool.toolu_xyz.json)
-   *   <session_id>.task.<tool_use_id>.json (e.g., abc123.task.toolu_xyz.json)
-   *   <session_id>.compacting.json
-   */
-  private parseSignalFilename(filepath: string): { sessionId: string; type: "working" | "permission" | "stop" | "ended" | "tool" | "task" | "compacting"; toolUseId?: string } | null {
-    const filename = filepath.replace(/\\/g, "/").split("/").pop() || "";
-
-    // Match tool signals: <session_id>.tool.<tool_use_id>.json
-    const toolMatch = filename.match(/^(.+)\.tool\.(.+)\.json$/);
-    if (toolMatch) return { sessionId: toolMatch[1], type: "tool", toolUseId: toolMatch[2] };
-
-    // Match task signals: <session_id>.task.<tool_use_id>.json
-    const taskMatch = filename.match(/^(.+)\.task\.(.+)\.json$/);
-    if (taskMatch) return { sessionId: taskMatch[1], type: "task", toolUseId: taskMatch[2] };
-
-    // Match compacting signals: <session_id>.compacting.json
-    const compactMatch = filename.match(/^(.+)\.compacting\.json$/);
-    if (compactMatch) return { sessionId: compactMatch[1], type: "compacting" };
-
-    // Match standard signals
-    const match = filename.match(/^(.+)\.(working|permission|stop|ended)\.json$/);
-    if (!match) return null;
-    return { sessionId: match[1], type: match[2] as "working" | "permission" | "stop" | "ended" };
-  }
-
-  /**
-   * Handle a signal file being created/updated.
-   */
-  private async handleSignalFile(filepath: string): Promise<void> {
-    const parsed = this.parseSignalFilename(filepath);
-    if (!parsed) return;
-
-    const { sessionId, type } = parsed;
-
-    try {
-      const content = await readFile(filepath, "utf-8");
-      const data = JSON.parse(content);
-
-      if (type === "working") {
-        log("Watcher", `Working signal for session ${sessionId}`);
-        this.logHook(`${sessionId}:working:${data.working_since}`, sessionId, "working", { signal: "working.json" });
-        this.transitionSession(sessionId, { type: "WORKING" }, { event: "WORKING", source: "hook", signal: "working.json" });
-      } else if (type === "permission") {
-        const permission = data as PendingPermission;
-        log("Watcher", `Pending permission for session ${sessionId}: ${permission.tool_name}`);
-        this.logHook(`${sessionId}:permission:${permission.pending_since}`, sessionId, "permission_request", { tool: permission.tool_name, signal: "permission.json" });
-
-        // Cancel any existing debounce timer
-        const existingTimer = this.permissionTimers.get(sessionId);
-        if (existingTimer) clearTimeout(existingTimer);
-
-        // Debounce: only send PERMISSION_REQUEST after delay.
-        // Auto-approved tools resolve quickly — their permission file gets deleted
-        // before the timer fires, so the timer callback becomes a no-op.
-        this.permissionTimers.set(sessionId, setTimeout(() => {
-          this.permissionTimers.delete(sessionId);
-          const s = this.sessions.get(sessionId);
-          if (s) s.pendingPermission = permission;
-          this.transitionSession(sessionId, { type: "PERMISSION_REQUEST" }, { event: "PERMISSION_REQUEST", source: "hook", signal: "permission.json", tool: permission.tool_name });
-        }, this.permissionDelayMs));
-      } else if (type === "stop") {
-        log("Watcher", `Stop signal for session ${sessionId}`);
-        this.logHook(`${sessionId}:stop:${data.stopped_at}`, sessionId, "stop", { signal: "stop.json" });
-        this.transitionSession(sessionId, { type: "STOP" }, { event: "STOP", source: "hook", signal: "stop.json" });
-      } else if (type === "ended") {
-        log("Watcher", `Session ended signal for ${sessionId}`);
-        this.logHook(`${sessionId}:ended:${data.ended_at}`, sessionId, "ended", { reason: data.reason, signal: "ended.json" });
-        this.transitionSession(sessionId, { type: "ENDED" }, { event: "ENDED", source: "hook", signal: "ended.json" });
-      } else if (type === "tool" && parsed.toolUseId) {
-        const toolSignal = data as ToolSignal;
-        log("Watcher", `Tool signal for session ${sessionId}: ${toolSignal.tool_name} (${parsed.toolUseId})`);
-        this.logHook(`${sessionId}:tool:${parsed.toolUseId}`, sessionId, "tool_start", { tool: toolSignal.tool_name, id: parsed.toolUseId, signal: `tool.${parsed.toolUseId}.json` });
-
-        // Store in tool signals map
-        let sessionTools = this.toolSignals.get(sessionId);
-        if (!sessionTools) {
-          sessionTools = new Map();
-          this.toolSignals.set(sessionId, sessionTools);
-        }
-        const activeTool: ActiveTool = {
-          toolUseId: parsed.toolUseId,
-          toolName: toolSignal.tool_name || "unknown",
-          toolInput: toolSignal.tool_input || {},
-          startedAt: toolSignal.started_at || new Date().toISOString(),
-        };
-        sessionTools.set(parsed.toolUseId, activeTool);
-
-        // Update session so UI can show active tools
-        const session = this.sessions.get(sessionId);
-        if (session) {
-          session.activeTools = this.getActiveToolsForSession(sessionId);
-          this.emit("session", { type: "updated", session } satisfies SessionEvent);
-        }
-      } else if (type === "task" && parsed.toolUseId) {
-        const taskSignal = data as TaskSignal;
-        log("Watcher", `Task signal for session ${sessionId}: ${taskSignal.agent_type || "unknown"} - ${taskSignal.description || ""}`);
-        this.logHook(`${sessionId}:task:${parsed.toolUseId}`, sessionId, "task_start", { agent: taskSignal.agent_type, desc: taskSignal.description, id: parsed.toolUseId, signal: `task.${parsed.toolUseId}.json` });
-
-        // Store in task signals map
-        let sessionTasks = this.taskSignals.get(sessionId);
-        if (!sessionTasks) {
-          sessionTasks = new Map();
-          this.taskSignals.set(sessionId, sessionTasks);
-        }
-        const activeTask: ActiveTask = {
-          toolUseId: parsed.toolUseId,
-          agentType: taskSignal.agent_type || "unknown",
-          description: taskSignal.description || "task",
-          startedAt: taskSignal.started_at || new Date().toISOString(),
-        };
-        sessionTasks.set(parsed.toolUseId, activeTask);
-
-        // Update session and transition to tasking
-        const session = this.sessions.get(sessionId);
-        if (session) {
-          session.activeTasks = this.getActiveTasksForSession(sessionId);
-          // Fire TASK_STARTED to transition working → tasking
-          // If already tasking (second task added), transition is a no-op but we still emit for data update
-          if (!this.transitionSession(sessionId, { type: "TASK_STARTED" }, { event: "TASK_STARTED", source: "hook", signal: `task.${parsed.toolUseId}.json` })) {
-            this.emit("session", { type: "updated", session } satisfies SessionEvent);
-          }
-        }
-      } else if (type === "compacting") {
-        const compactSignal = data as CompactingSignal;
-        log("Watcher", `Compacting signal for session ${sessionId}`);
-        this.logHook(`${sessionId}:compacting:${compactSignal.started_at}`, sessionId, "compacting", { signal: "compacting.json" });
-        this.compactingSignals.set(sessionId, compactSignal.started_at || new Date().toISOString());
-
-        // Update session
-        const session = this.sessions.get(sessionId);
-        if (session) {
-          session.activeTasks = this.getActiveTasksForSession(sessionId);
-          this.emit("session", { type: "updated", session } satisfies SessionEvent);
-        }
-      }
-    } catch {
-      // Ignore parse errors
-    }
+  getSessions(): Map<string, SessionState> {
+    return this.sessions;
   }
 
   /**
@@ -453,118 +493,6 @@ export class SessionWatcher extends EventEmitter {
   private getActiveToolsForSession(sessionId: string): ActiveTool[] {
     const tools = this.toolSignals.get(sessionId);
     return tools ? Array.from(tools.values()) : [];
-  }
-
-  /**
-   * Handle a signal file being removed.
-   */
-  private handleSignalRemoved(filepath: string): void {
-    const parsed = this.parseSignalFilename(filepath);
-    if (!parsed) return;
-
-    const { sessionId, type } = parsed;
-    log("Watcher", `Signal removed for session ${sessionId}: ${type}`);
-
-    if (type === "permission") {
-      appendHookEvent(sessionId, "permission_resolved", { signal: "permission.json" });
-      // Cancel debounce timer
-      const timer = this.permissionTimers.get(sessionId);
-      if (timer) { clearTimeout(timer); this.permissionTimers.delete(sessionId); }
-
-      // If debounce already fired (machine is in needs_approval), transition back to working.
-      // PostToolUse/PostToolUseFailure hook deleted permission.json → tool completed.
-      const session = this.sessions.get(sessionId);
-      if (session?.machineState === "needs_approval") {
-        this.transitionSession(sessionId, { type: "WORKING" },
-          { event: "WORKING", source: "hook", signal: "permission.json removed" });
-      }
-    } else if (type === "tool" && parsed.toolUseId) {
-      const sessionTools = this.toolSignals.get(sessionId);
-      const removedTool = sessionTools?.get(parsed.toolUseId);
-      appendHookEvent(sessionId, "tool_end", { tool: removedTool?.toolName, id: parsed.toolUseId, signal: `tool.${parsed.toolUseId}.json` });
-      if (sessionTools) {
-        sessionTools.delete(parsed.toolUseId);
-        if (sessionTools.size === 0) {
-          this.toolSignals.delete(sessionId);
-        }
-      }
-      const session = this.sessions.get(sessionId);
-      if (session) {
-        session.activeTools = this.getActiveToolsForSession(sessionId);
-        this.emit("session", { type: "updated", session } satisfies SessionEvent);
-      }
-    } else if (type === "task" && parsed.toolUseId) {
-      const sessionTasks = this.taskSignals.get(sessionId);
-      const removedTask = sessionTasks?.get(parsed.toolUseId);
-      appendHookEvent(sessionId, "task_end", { agent: removedTask?.agentType, id: parsed.toolUseId, signal: `task.${parsed.toolUseId}.json` });
-      if (sessionTasks) {
-        sessionTasks.delete(parsed.toolUseId);
-        if (sessionTasks.size === 0) {
-          this.taskSignals.delete(sessionId);
-        }
-      }
-      const session = this.sessions.get(sessionId);
-      if (session) {
-        session.activeTasks = this.getActiveTasksForSession(sessionId);
-        // Fire TASKS_DONE when all tasks are complete → transitions tasking → working
-        if (session.activeTasks.length === 0) {
-          if (!this.transitionSession(sessionId, { type: "TASKS_DONE" }, { event: "TASKS_DONE", source: "hook", signal: `task.${parsed.toolUseId}.json removed` })) {
-            this.emit("session", { type: "updated", session } satisfies SessionEvent);
-          }
-        } else {
-          this.emit("session", { type: "updated", session } satisfies SessionEvent);
-        }
-      }
-    } else if (type === "compacting") {
-      appendHookEvent(sessionId, "compacting_end", { signal: "compacting.json" });
-      this.compactingSignals.delete(sessionId);
-      const session = this.sessions.get(sessionId);
-      if (session) {
-        session.activeTasks = this.getActiveTasksForSession(sessionId);
-        // Fire TASKS_DONE if no tasks remain after compacting ends
-        if (session.activeTasks.length === 0) {
-          if (!this.transitionSession(sessionId, { type: "TASKS_DONE" }, { event: "TASKS_DONE", source: "hook" })) {
-            this.emit("session", { type: "updated", session } satisfies SessionEvent);
-          }
-        } else {
-          this.emit("session", { type: "updated", session } satisfies SessionEvent);
-        }
-      }
-    }
-  }
-
-  stop(): void {
-    if (this.watcher) {
-      this.watcher.close();
-      this.watcher = null;
-    }
-
-    if (this.signalWatcher) {
-      this.signalWatcher.close();
-      this.signalWatcher = null;
-    }
-
-    // Clear stale check interval
-    if (this.staleCheckInterval) {
-      clearInterval(this.staleCheckInterval);
-      this.staleCheckInterval = null;
-    }
-
-    // Clear all debounce timers
-    for (const timer of this.debounceTimers.values()) {
-      clearTimeout(timer);
-    }
-    this.debounceTimers.clear();
-
-    // Clear all permission debounce timers
-    for (const timer of this.permissionTimers.values()) {
-      clearTimeout(timer);
-    }
-    this.permissionTimers.clear();
-  }
-
-  getSessions(): Map<string, SessionState> {
-    return this.sessions;
   }
 
   /**
@@ -727,7 +655,7 @@ export class SessionWatcher extends EventEmitter {
       // If compacting signal exists and new entries arrived, compaction is done
       if (newEntries.length > 0 && this.compactingSignals.has(sessionId)) {
         this.compactingSignals.delete(sessionId);
-        this.cleanupSignalFile(sessionId, "compacting");
+        appendHookEvent(sessionId, "compacting_end", { source: "jsonl-arrival" });
       }
 
       // Build session state - prefer branch from git info over log entry

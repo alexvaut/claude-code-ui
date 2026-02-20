@@ -6,7 +6,7 @@ A real-time Kanban dashboard for monitoring Claude Code sessions across projects
 
 pnpm monorepo with two packages:
 
-- **`packages/daemon`** — Node.js backend that receives hook signals from Claude Code sessions, derives status via a pure state machine, reads JSONL for content only, and publishes state over `@durable-streams/server` (port 4450)
+- **`packages/daemon`** — Node.js backend that receives hook events from Claude Code sessions via HTTP POST, derives status via a pure state machine, reads JSONL for content only, and publishes state over `@durable-streams/server` (port 4450)
 - **`packages/ui`** — React 19 + Vite 7 frontend that subscribes to the daemon stream via `@tanstack/react-db` and displays sessions in a Kanban board grouped by Git repo
 
 ## Getting Started
@@ -59,11 +59,11 @@ pnpm setup          # install Claude hooks for session signals
 ### Daemon
 - `SessionWatcher` (EventEmitter) in `src/watcher.ts` is the core; it drives `StreamServer` in `src/server.ts`
 - State machine is a pure `transition(state, event, isWorktree)` function in `src/status-machine.ts` — 6 internal states (`working`, `tasking`, `needs_approval`, `waiting`, `review`, `idle`), 7 hook events
-- Hook signals (`~/.claude/session-signals/*.json`) are the **sole** source of state transitions — JSONL only provides content (timestamps, message counts, todo progress)
+- Hooks forward raw JSON payloads via HTTP POST (`POST /hook` on port 4451) to the daemon — a single `forward-hook.sh` script handles all 8 hook events; the daemon's `handleHook()` method is the sole source of state transitions — JSONL only provides content (timestamps, message counts, todo progress)
 - `needs_approval` is internal; published as `waiting` with `hasPendingToolUse: true` — 5 public statuses
 - Permission debounce (3s) prevents false "Needs Approval" from auto-approved tools
 - Worktree sessions use `review` instead of `waiting`/`idle`; persistent git cache at `~/.claude/git-info-cache.json` survives worktree deletion
-- Transition logs written to `~/.claude/session-logs/`, served via HTTP on port 4451; logs include both `[hook]` event lines (every hook signal) and state transition lines
+- Transition logs written to `~/.claude/session-logs/`, served via HTTP on port 4451; logs include both `[hook]` event lines (every hook event) and state transition lines
 - AI summaries generated with `@anthropic-ai/sdk` (Claude Sonnet) in `src/summarizer.ts`
 - PR/CI status polled via `gh` CLI in `src/github.ts`
 - See `packages/daemon/HOOK-LIFECYCLE.md` for full hook event documentation
@@ -73,13 +73,15 @@ pnpm setup          # install Claude hooks for session signals
 | File | Purpose |
 |------|---------|
 | `packages/daemon/src/serve.ts` | Daemon entry point |
-| `packages/daemon/src/watcher.ts` | File watcher + session tracking |
-| `packages/daemon/src/status-machine.ts` | Pure state transition function (hook-signal driven) |
+| `packages/daemon/src/watcher.ts` | JSONL watcher + session tracking + `handleHook()` |
+| `packages/daemon/src/hook-handler.ts` | HTTP handler for `POST /hook` + Zod validation |
+| `packages/daemon/src/status-machine.ts` | Pure state transition function (hook-driven) |
 | `packages/daemon/src/schema.ts` | Zod schemas + durable streams state schema |
 | `packages/daemon/src/server.ts` | Stream server publishing |
 | `packages/daemon/src/git.ts` | Git info resolution with worktree support |
 | `packages/daemon/src/transition-log.ts` | Per-session state transition + hook event logging |
-| `packages/daemon/src/log-server.ts` | HTTP server for transition logs (port 4451) |
+| `packages/daemon/src/log-server.ts` | HTTP server for transition logs + hook endpoint (port 4451) |
+| `packages/daemon/scripts/hooks/forward-hook.sh` | Single hook script for all 8 events (POST to daemon) |
 | `packages/daemon/HOOK-LIFECYCLE.md` | Empirical hook event documentation |
 | `packages/ui/src/main.tsx` | React entry point |
 | `packages/ui/src/routes/__root.tsx` | Root layout (Theme, header) |
@@ -90,8 +92,12 @@ pnpm setup          # install Claude hooks for session signals
 
 ## Verification
 
-- Always verify UI changes with MCP Playwright — save screenshots to `screenshots/` with numbered prefix (e.g. `001-panels.png`)
+
 
 ## Instructions
 
 - `CLAUDE.md` and `README.md` must be kept up to date — every plan must include a step to update docs if the changes affect architecture, states, schemas, or key files
+- Always verify UI changes with MCP Playwright — save screenshots to `screenshots/` with numbered prefix (e.g. `001-panels.png`)
+- if something fails, build a failing unit tests first that is reproducing then fix it
+- Always respect the architecture, for example: hooks are first classe al the way !
+- DRY principle: always !

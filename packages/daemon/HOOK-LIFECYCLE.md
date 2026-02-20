@@ -1,26 +1,25 @@
 # Claude Code Hook Lifecycle — Empirical Findings
 
 Verified by logging all 14 hook events via `debug-hook.sh`.
-Log file: `~/.claude/session-signals/hook-debug.log`
 
 ## Available Hooks (14 total)
 
-| # | Hook Event | Matcher support | Currently registered (production) |
-|---|-----------|----------------|-----------------------------------|
+| # | Hook Event | Matcher support | Forwarded to daemon |
+|---|-----------|----------------|---------------------|
 | 1 | `SessionStart` | session start type | no |
-| 2 | `UserPromptSubmit` | no | yes → `working.json` |
-| 3 | `PreToolUse` | tool name | yes (Task only) → `task.*.json` |
-| 4 | `PermissionRequest` | tool name | yes → `permission.json` |
-| 5 | `PostToolUse` | tool name | yes (Task only) → deletes `task.*.json` |
-| 6 | `PostToolUseFailure` | tool name | no |
+| 2 | `UserPromptSubmit` | no | yes |
+| 3 | `PreToolUse` | tool name | yes |
+| 4 | `PermissionRequest` | tool name | yes |
+| 5 | `PostToolUse` | tool name | yes |
+| 6 | `PostToolUseFailure` | tool name | yes |
 | 7 | `Notification` | notification type | no |
 | 8 | `SubagentStart` | agent type | no |
 | 9 | `SubagentStop` | agent type | no |
-| 10 | `Stop` | no | yes → `stop.json` |
+| 10 | `Stop` | no | yes |
 | 11 | `TeammateIdle` | no | no |
 | 12 | `TaskCompleted` | no | no |
-| 13 | `PreCompact` | compaction type | yes → `compacting.json` |
-| 14 | `SessionEnd` | exit reason | yes → `ended.json` |
+| 13 | `PreCompact` | compaction type | yes |
+| 14 | `SessionEnd` | exit reason | yes |
 
 ---
 
@@ -172,11 +171,17 @@ Key observations:
 
 **Result**: Full subagent lifecycle visible:
 1. `PreToolUse`/Task fires before subagent spawn
-2. `SubagentStart` fires with `agent_type=Bash`
+2. `SubagentStart` fires with `agent_type=Bash` **and `agent_id`** (unique per subagent instance)
 3. Subagent's own tools fire `PreToolUse`/`PostToolUse` on the same session
-4. `SubagentStop` fires when subagent finishes
+4. `SubagentStop` fires when subagent finishes (also carries `agent_id`)
 5. `PostToolUse`/Task fires AFTER subagent completes
 6. Both `SubagentStart`/`SubagentStop` AND `PreToolUse`/`PostToolUse` (Task) fire — they're complementary, not alternatives
+
+**Tool attribution limitation** (verified via full payload dump, Scenario 12):
+- `SubagentStart`/`SubagentStop` carry `agent_id` (e.g., `"a25c31a"`)
+- `PreToolUse`/`PostToolUse` inside subagents do **NOT** carry `agent_id` — payload is identical to main-agent tool events
+- This means tools inside subagents cannot be directly attributed to their parent subagent
+- Temporal attribution (tools between SubagentStart/SubagentStop) works for a single foreground subagent, but is ambiguous with multiple concurrent subagents
 
 ---
 
@@ -262,6 +267,31 @@ Key observations:
 
 ---
 
+### Scenario 12: Subagent hook payload inspection ✅
+
+**Session**: `dff2ba48` | **Mode**: `bypassPermissions`
+
+Full JSON payloads dumped (via modified debug hook with `jq -c 'del(.tool_input)'`) to verify what fields are available on each hook event, especially inside subagents.
+
+```
+PreToolUse/Task      → {session_id, transcript_path, cwd, permission_mode, hook_event_name, tool_name, tool_use_id}
+SubagentStart        → {session_id, transcript_path, cwd, hook_event_name, agent_id: "a25c31a", agent_type: "Bash"}
+PreToolUse/Bash      → {session_id, transcript_path, cwd, permission_mode, hook_event_name, tool_name, tool_use_id}
+PostToolUse/Bash     → {session_id, transcript_path, cwd, permission_mode, hook_event_name, tool_name, tool_use_id}
+SubagentStop         → {session_id, transcript_path, cwd, hook_event_name, agent_id: "a25c31a", agent_type: "Bash"}
+PostToolUse/Task     → {session_id, transcript_path, cwd, permission_mode, hook_event_name, tool_name, tool_use_id}
+```
+
+**Result**: **`PreToolUse`/`PostToolUse` inside subagents do NOT carry `agent_id` or any subagent identifier.**
+
+Key findings:
+1. `SubagentStart` has `agent_id` (short hash, e.g., `"a25c31a"`) + `agent_type` — uniquely identifies each subagent instance
+2. `SubagentStop` has the same `agent_id` + `agent_type` — correctly brackets the subagent lifecycle
+3. `PreToolUse`/`PostToolUse` inside subagents have the **exact same fields** as main-agent tool events — no `agent_id`, no `parent_tool_use_id`, no subagent context
+4. This means tool → subagent attribution must rely on temporal ordering (unambiguous for single subagent, ambiguous for concurrent)
+
+---
+
 ### Bonus: This session's own events (session `9dd99bcd`, mode `bypassPermissions`)
 
 From the current Claude Code VSCode session:
@@ -284,8 +314,8 @@ From the current Claude Code VSCode session:
 | `PermissionRequest` | ✅ | When tool requires user approval (Bash, Write, ExitPlanMode, AskUserQuestion) |
 | `PostToolUse` | ✅ | After every successful tool AND after user approves a permission |
 | `PostToolUseFailure` | ✅ | After failed tool OR after user denies a permission |
-| `SubagentStart` | ✅ | When subagent spawns (has agent_type) |
-| `SubagentStop` | ✅ | When subagent finishes (has agent_type) |
+| `SubagentStart` | ✅ | When subagent spawns (has `agent_id` + `agent_type`) |
+| `SubagentStop` | ✅ | When subagent finishes (has `agent_id` + `agent_type`) |
 | `Stop` | ✅ | When turn ends |
 | `SessionEnd` | ✅ | When session terminates |
 | `Notification` | ❌ | Never fired in any scenario (11 tested). Possibly unused or very specific trigger. |
@@ -299,6 +329,8 @@ From the current Claude Code VSCode session:
 2. **Does `PostToolUseFailure` fire after user denies a tool?** ✅ **YES** (Scenario 4)
 3. **Does `PostToolUse` fire for `ExitPlanMode`?** ✅ **YES** (Scenario 5 — THE key question)
 4. **Does `AskUserQuestion` trigger `PermissionRequest`?** ✅ **YES** — same pattern as all permission tools (Scenario 6)
+5. **Do `PreToolUse`/`PostToolUse` inside subagents carry `agent_id`?** ❌ **NO** — payload is identical to main-agent events (Scenario 12)
+6. **Do `SubagentStart`/`SubagentStop` carry `agent_id`?** ✅ **YES** — unique per instance, e.g., `"a25c31a"` (Scenario 12)
 
 ### Complete hook sequences (all verified)
 
@@ -338,18 +370,4 @@ Agent teams:
   ... teammate works: TaskUpdate → TaskCompleted ...
   SubagentStop/worker → TeammateIdle → SubagentStart/worker (resume) → ...
 ```
-
-### Signal → state transition mapping (current + fix)
-
-| Signal needed | Current hook source | Gap? | Fix |
-|--------------|--------------------|----- |-----|
-| → working | `UserPromptSubmit` → `working.json` | No | — |
-| → needs_approval | `PermissionRequest` → `permission.json` (3s debounce) | No | — |
-| → working (after approval) | **NONE** | **YES** | `PostToolUse` (all) + `PostToolUseFailure` (all) → delete `permission.json` |
-| → tasking | `PreToolUse`/Task → `task.*.json` | No | — |
-| → working (tasks done) | `PostToolUse`/Task → deletes `task.*.json` | No | — |
-| → waiting | `Stop` → `stop.json` | No | — |
-| → idle | `SessionEnd` → `ended.json` | No | — |
-
-
 
